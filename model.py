@@ -5,6 +5,10 @@ import numbers
 
 from einops import rearrange
 
+# FMA-Net 核心模型代码
+# 功能:这是一个两阶段的视频恢复网络。第一阶段(NetD)学习图像如何变模糊，生成退化内核和对齐光流;第二阶段(NetR)利用这些特征，通过多头注意力和动态上采样，将模糊序列还原为清晰的高分辨率图像。
+# 输入:x:模糊/低分辨率的连续视频帧[B，3，T，H，W]，y:(仅训练时)对应的清晰/高分辨率参考帧[B，3，T，sH，sW]
+# 输出:一个字典，包含最终恢复的图像output、重构的低分辨率图像 recon以及用于对齐的光流和特征。
 
 def to_3d(x):
     return rearrange(x, 'b c h w -> b (h w) c')
@@ -191,21 +195,25 @@ class MultiFlowBWarp(torch.nn.Module):
 
 
 class PixelShuffleBlock(torch.nn.Module):
-    def __init__(self, channels, bias):
+    def __init__(self, channels, bias, scale):
         super(PixelShuffleBlock, self).__init__()
-        self.conv1 = nn.Conv2d(channels, channels * 4, kernel_size=3, padding=1, stride=1, bias=bias)
-        self.conv2 = nn.Conv2d(channels, channels * 4, kernel_size=3, padding=1, stride=1, bias=bias)
-        self.conv3 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, stride=1, bias=bias)
-        self.relu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
-        self.shuffle = torch.nn.PixelShuffle(2)
+        self.scale = scale
+        if scale > 1:
+            # 超分路径
+            out_c = channels * (scale ** 2)
+            self.conv1 = nn.Conv2d(channels, out_c, 3, 1, 1, bias=bias)
+            self.shuffle = nn.PixelShuffle(scale)
+        else:
+            # 去盲元路径 (Scale=1)
+            self.conv1 = nn.Conv2d(channels, channels, 3, 1, 1, bias=bias)
+            self.shuffle = nn.Identity()
+
+        self.conv2 = nn.Conv2d(channels, channels, 3, 1, 1, bias=bias)
+        self.relu = nn.LeakyReLU(0.2, inplace=True)
 
     def forward(self, x):
-        x = self.relu(self.conv1(x))
-        x = self.shuffle(x)
+        x = self.relu(self.shuffle(self.conv1(x)))
         x = self.relu(self.conv2(x))
-        x = self.shuffle(x)
-        x = self.relu(self.conv3(x))
-
         return x
 
 
@@ -449,7 +457,8 @@ class Net_D(torch.nn.Module):
         ffn_expansion_factor = config.ffn_expansion_factor
         bias = config.bias
 
-        self.feature_extractor = nn.Sequential(nn.Conv3d(in_channels, dim, kernel_size=[1,3,3], padding=[0,1,1], stride=1, bias=bias),
+        self.feature_extractor = nn.Sequential(
+            nn.Conv3d(in_channels, dim, kernel_size=[1, 3, 3], padding=[0, 1, 1], stride=1, bias=bias),
                                                nn.LeakyReLU(negative_slope=0.2, inplace=True),
                                                RRDB(dim=dim, num_RDB=num_RDB, growth_rate=growth_rate, num_dense_layer=num_dense_layer, bias=config.bias))
 
@@ -517,7 +526,7 @@ class Net_R(torch.nn.Module):
         bias = config.bias
         scale = config.scale
 
-        self.feature_extractor = nn.Sequential(nn.Conv3d(in_channels+dim, dim, kernel_size=[1,3,3], padding=[0,1,1], stride=1, bias=bias),
+        self.feature_extractor = nn.Sequential(nn.Conv3d(in_channels + dim, dim, kernel_size=[1, 3, 3], padding=[0, 1, 1], stride=1, bias=bias),
                                                nn.LeakyReLU(negative_slope=0.2, inplace=True),
                                                RRDB(dim=dim, num_RDB=num_RDB, growth_rate=growth_rate, num_dense_layer=num_dense_layer, bias=config.bias))
 
@@ -536,7 +545,7 @@ class Net_R(torch.nn.Module):
         self.res_conv1 = nn.Conv2d(dim, dim, kernel_size=3, padding=1, stride=1, bias=bias)
         self.res_conv2 = nn.Conv2d(dim, in_channels, kernel_size=3, padding=1, stride=1, bias=bias)
         self.relu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
-        self.upsample = PixelShuffleBlock(dim, bias=bias)
+        self.upsample = PixelShuffleBlock(dim, bias=bias, scale=config.scale)
 
         # generate restoration kernels
         self.r_conv = nn.Sequential(nn.Conv3d(dim//num_seq, dim, kernel_size=[1, 3, 3], padding=[0, 1, 1], stride=1, bias=bias),
@@ -585,12 +594,12 @@ class Net_R(torch.nn.Module):
         KR = rearrange(Fw, 'b (c t) h w -> b c t h w', t=T)
         KR = self.r_conv(KR)
 
-        f_X = self.f_conv2(f)
-        _, warped_X = self.bwarp(x, f_X)
-        f_X = self.f_conv3(torch.cat([f, warped_X, x[:, :, T // 2:T // 2 + 1, :, :].repeat([1, 1, T, 1, 1])], dim=1))
-
-        # flow-guided dynamic upsampling
-        _, warped_X = self.bwarp(x, f_X)
+        # 建议：将中间变量改名，增加可读性并防止逻辑混淆
+        f_X_initial = self.f_conv2(f)
+        _, warped_X_pre = self.bwarp(x, f_X_initial)
+        f_X_final = self.f_conv3(
+            torch.cat([f, warped_X_pre, x[:, :, T // 2:T // 2 + 1, :, :].repeat([1, 1, T, 1, 1])], dim=1))
+        _, warped_X = self.bwarp(x, f_X_final)  # 最终对齐
         output = self.duf(warped_X, KR) + res
         anchor = self.a_conv(F)
 
@@ -637,3 +646,4 @@ class FMANet(torch.nn.Module):
             result_dict['F_sharp_R'] = anchor_R
 
             return result_dict
+

@@ -1,11 +1,17 @@
 import os
 import configparser
 
+#配置管理模块
+# 功能：使用 Python 的 configparser 库读取并解析外部配置文件（通常是 .ini 或 .cfg 文件），将散乱的配置参数（如学习率、网络深度、数据集路径等）统一封装进一个 Config 对象中，方便在整个项目（训练、推理、测试）中通过点号（如 config.lr）进行访问。
+# 输入：配置文件的路径 config_path。
+# 输出：一个包含所有实验参数、训练超参数、网络架构设置和路径信息的配置对象。
 
 class Config:
     def __init__(self, config_path):
         parser = configparser.ConfigParser()
-        parser.read(config_path)
+        # 使用 utf-8 编码打开文件
+        with open(config_path, 'r', encoding='utf-8') as f:
+            parser.read_file(f)
 
         # experiment
         self.seed = int(parser.get('experiment', 'seed'))
@@ -58,3 +64,5 @@ class Config:
 
         # test
         self.custom_path = parser.get('test', 'custom_path')
+
+        self.need_patch = (parser.get('training', 'need_patch') == 'True')

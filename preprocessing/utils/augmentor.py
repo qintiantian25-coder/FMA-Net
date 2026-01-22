@@ -3,6 +3,12 @@ import random
 import math
 from PIL import Image
 
+# 光流数据增强模块 (Flow Augmentor)
+# 功能：这段代码的作用是给模型“增加考试难度”。在训练光流估计或视频对齐模型时，为了防止模型死记硬背训练数据，该模块会对输入的图像对和对应的光流场进行随机加工。
+# 它通过模拟不同的亮度、遮挡和变形，让模型学会在复杂的环境下依然能准确识别物体运动。
+# 输入：两张相邻的图像（img1, img2）以及它们之间的光流真实值（flow）。
+# 直接产出：经过随机变换后的图像对和与之同步更新的光流场。
+
 import cv2
 cv2.setNumThreads(0)
 cv2.ocl.setUseOpenCL(False)

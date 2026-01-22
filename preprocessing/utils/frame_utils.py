@@ -9,6 +9,11 @@ cv2.ocl.setUseOpenCL(False)
 
 TAG_CHAR = np.array([202021.25], np.float32)
 
+# 跨格式 IO 读写模块 (Input/Output Utilities)
+# 功能：这段代码是项目的“全能文件翻译官”。光流任务的数据格式非常杂乱，既有学术界标准的 .flo，也有高精度的 .pfm，还有针对自动驾驶场景（KITTI）专门编码的 .png。
+# 该模块统一了这些格式的读取和写入逻辑，确保模型能够无缝处理来自不同数据集的数据。
+# 输入/输出：根据后缀名（.flo, .pfm, .png, .bin 等）自动选择对应的解析算法，输出标准的 NumPy 数组。
+
 def readFlow(fn):
     """ Read .flo file in Middlebury format"""
     # Code adapted from:

@@ -9,6 +9,10 @@ from raft import RAFT
 from tqdm import tqdm
 from pathlib import Path
 
+# 光流生成脚本
+# 功能:调用预训练的RAFT模型，对指定数据集(如REDS4)中的连续视频帧进行推理，计算并保存帧与帧之间的双向光流数据。
+# 输入:包含视频帧图像(.png)的文件夹路径。
+# 输出:保存为.npy格式的光流场文件，记录了中心帧指向前后相邻帧的像素位移
 
 def read_img(filename):
     img = cv2.imread(filename)
@@ -94,5 +98,6 @@ if __name__ == '__main__':
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
-    generate_flow('./dataset/REDS4/train_sharp_bicubic/train/train_sharp_bicubic/X4')
-    generate_flow('./dataset/REDS4/val_sharp_bicubic/val/val_sharp_bicubic/X4')
+    # 指向你的干净图根目录
+    generate_flow(r'D:\mangyuan\FMA-Net\data\train_sharp')
+    generate_flow(r'D:\mangyuan\FMA-Net\data\val_sharp')

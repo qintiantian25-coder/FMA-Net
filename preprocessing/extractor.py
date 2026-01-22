@@ -2,6 +2,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# 图像特征编码模块功能
+# 功能：通过卷积层和残差结构(Residual/Bottleneck Block)对图像进行下采样和特征提取，将原始像素信息转换为深层特征向量。
+# 输入:RGB图像张量，尺寸为[B，3，H，W]。
+# 输出:降采样后的特征图(分辨率通常为原图1/8)，尺寸为[B，output_dim，H/8,W/8]
 
 class ResidualBlock(nn.Module):
     def __init__(self, in_planes, planes, norm_fn='group', stride=1):

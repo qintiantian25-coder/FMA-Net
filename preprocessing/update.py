@@ -2,6 +2,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# RAFT循环更新模块
+# 功能:这是RAFT算法的迭代核心，负责接收当前的光流估计和相似度信息，通过卷积门控循环单元(ConvGRU)计算出当前位移的修正量(Residual update)，实现光流的逐步精细化。
+# 输入:当前状态特征(net)、上下文特征(inp)、相关性特征(corr)以及当前的光流场(flow)。
+# 输出:更新后的状态特征(net)、用于上采样的掩码(mosk)以及光流修正量(delta_flow)。
 
 class FlowHead(nn.Module):
     def __init__(self, input_dim=128, hidden_dim=256):

@@ -8,6 +8,11 @@ from extractor import BasicEncoder, SmallEncoder
 from corr import CorrBlock, AlternateCorrBlock
 from utils.utils import bilinear_sampler, coords_grid, upflow8
 
+# RAFT模型主网络
+# 功能:这是RAFT算法的核心实现。它通过特征提取、构建全像素相关性金字塔，并使用基于GRU的循环单元(Update Block)迭代地更新位移估计，最终通过凸上采样(ConvexUpsampling)输出高分辨率光流场。
+# 输入:两张RGB图像张量image1和 image2，维度为[B，3，H，W]
+# 输出:一个包含多次迭代结果的列表flow_predictions，每个元素是尺寸为[B，2,H，W] 的光流场
+
 try:
     autocast = torch.cuda.amp.autocast
 except:

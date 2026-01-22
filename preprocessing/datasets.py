@@ -14,6 +14,10 @@ import os.path as osp
 from utils import frame_utils
 from utils.augmentor import FlowAugmentor, SparseFlowAugmentor
 
+# 数据读取模块
+# 功能:从磁盘读取光流数据集，并进行图像格式转换、数据增强和批量化打包。
+# 输入:存储图片的路径、数据集类型以及裁剪/缩放等预处理参数。
+# 输出:成对的图像张量、对应的真实光流(GroundTruth)以及有效像素掩码(ValidMask) 。
 
 class FlowDataset(data.Dataset):
     def __init__(self, aug_params=None, sparse=False):

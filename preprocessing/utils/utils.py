@@ -3,6 +3,10 @@ import torch.nn.functional as F
 import numpy as np
 from scipy import interpolate
 
+# 几何变换与张量处理模块 (Geometry & Tensor Utilities)
+# 功能：这段代码是项目的“几何工具箱”。在视频恢复和光流估计中，图像的大小经常不符合网络要求（如必须是 8 的倍数），或者需要根据预测的运动轨迹对图像进行像素级的重采样。该模块提供了尺寸填充、前向插值和双线性采样等核心几何操作。
+# 输入：任意维度的图像张量、光流场或坐标网格。
+# 直接产出：尺寸对齐后的图像、基于运动轨迹重采样（Warping）后的图像，或放大后的高分辨率光流。
 
 class InputPadder:
     """ Pads images such that dimensions are divisible by 8 """

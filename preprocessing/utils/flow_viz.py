@@ -15,6 +15,12 @@
 # Author: Tom Runia
 # Date Created: 2018-08-03
 
+# 光流可视化模块 (Optical Flow Visualization)
+# 功能：这段代码是“数据转图像”的翻译官。光流数据通常是两层复杂的浮点数（代表像素在水平 u 和垂直 v 方向的位移），肉眼无法直接看出运动轨迹。
+# 该模块利用 Middlebury 标准色轮算法，将这些位移数值映射为五彩斑斓的颜色图像，让你直观地“看到”物体的运动方向和速度。
+# 输入：形状为 [H, W, 2] 的光流张量（位移数值）。
+# 直接产出：一张 RGB 或 BGR 格式的彩色图片 [H, W, 3]。
+
 import numpy as np
 
 def make_colorwheel():

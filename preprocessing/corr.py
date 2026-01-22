@@ -2,6 +2,11 @@ import torch
 import torch.nn.functional as F
 from utils.utils import bilinear_sampler, coords_grid
 
+# 相似度计算模块
+# 功能:计算两张特征图在多个空间尺度下的互相关得分(相似度)，用于定位像素的移动。
+# 输入:两张特征图(fmap1，fmap2)和当前像素坐标(coords)。
+# 输出:一组局部相关性特征，表示预测位置周围的匹配强度。
+
 try:
     import alt_cuda_corr
 except:
