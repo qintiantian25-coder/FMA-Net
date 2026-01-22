@@ -1,5 +1,12 @@
 import os
 import torch
+# 1. 强制同步，报错位置会变得精确
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+# 2. 禁用 cuDNN 优化，避免黑盒算子错误
+torch.backends.cudnn.enabled = False
+torch.backends.cudnn.benchmark = False
+# 3. 针对 Blackwell 的特殊设置
+torch.backends.cuda.matmul.allow_tf32 = True
 import random
 import argparse
 import numpy as np

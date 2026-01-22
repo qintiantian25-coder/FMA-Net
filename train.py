@@ -72,7 +72,11 @@ class Trainer:
                     result_dict['hr_warp'],
                     hr_sharp_seq[:, :, t // 2:t // 2 + 1, :, :].repeat([1, 1, t, 1, 1])
                 )
-                flow_loss = self.config.flow_loss_weight * self.criterion(result_dict['image_flow'], flow)
+                # 修改为以下逻辑（处理维度不匹配）：
+                b, _, t, h, w = result_dict['image_flow'].size()
+                # 将 target flow 从 [B, 10, H, W] 重塑为 [B, 2, 5, H, W] 以匹配模型输出
+                target_flow = flow.view(b, 2, t, h, w)
+                flow_loss = self.config.flow_loss_weight * self.criterion(result_dict['image_flow'], target_flow)
                 D_TA_loss = self.config.D_TA_loss_weight * self.criterion(result_dict['F_sharp_D'], lr_sharp_seq)
 
                 total_loss = recon_loss + hr_warping_loss + flow_loss + D_TA_loss
@@ -97,8 +101,11 @@ class Trainer:
                     result_dict['hr_warp'],
                     hr_sharp_seq[:, :, t // 2:t // 2 + 1, :, :].repeat([1, 1, t, 1, 1])
                 )
+                # --- 修正后的 Stage 2 光流 Loss ---
+                b, _, t, h, w = result_dict['image_flow'].size()
+                target_flow = flow.view(b, 2, t, h, w)
                 flow_loss = self.config.Net_D_weight * self.config.flow_loss_weight * self.criterion(
-                    result_dict['image_flow'], flow)
+                    result_dict['image_flow'], target_flow)  # 记得加上 target_flow
                 R_TA_loss = self.config.R_TA_loss_weight * self.criterion(result_dict['F_sharp_R'], lr_sharp_seq)
                 D_TA_loss = self.config.Net_D_weight * self.config.D_TA_loss_weight * self.criterion(
                     result_dict['F_sharp_D'], lr_sharp_seq)
