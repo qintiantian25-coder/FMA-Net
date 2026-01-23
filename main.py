@@ -25,12 +25,12 @@ def count_parameters(model):
 
 def train(config):
     global_step = 0
-    # 注意：确保 Report 类能接受 save_dir, type, stage 参数
     train_log = Report(config.save_dir, type='train', stage=config.stage)
     val_log = Report(config.save_dir, type='val', stage=config.stage)
 
     train_dataloader = get_dataset(config, type='train')
-    valid_dataloader = get_dataset(config, type='val')
+    # 保持变量名统一：使用 val_dataloader
+    val_dataloader = get_dataset(config, type='val')
 
     model = FMANet(config=config)
     trainer = Trainer(config=config, model=model)
@@ -50,11 +50,25 @@ def train(config):
         global_step = trainer.train(train_dataloader, train_log, global_step)
 
         if (epoch + 1) % config.val_period == 0 or epoch == config.num_epochs - 1:
-            psnr = trainer.validate(valid_dataloader, val_log, epoch + 1)
-            trainer.save_checkpoint(epoch + 1)
-            if psnr > best_psnr:
-                best_psnr = psnr
-                trainer.save_best_model(epoch + 1)
+            # 传入统一后的变量名 val_dataloader
+            val_result = trainer.validate(val_dataloader, val_log, epoch)
+
+            # 稳健地提取 PSNR 数值
+            if isinstance(val_result, list):
+                # 如果是 Stage 1，通常 Recon PSNR 是较大的那个数（80左右）
+                # 如果是 Stage 2，通常第一个数是修复 PSNR
+                if config.stage == 1:
+                    current_psnr = max(val_result) # Stage 1 取最高重建质量
+                else:
+                    current_psnr = val_result[0]   # Stage 2 取修复指标
+            else:
+                current_psnr = val_result
+
+            # 进行比较并保存最优模型
+            if current_psnr > best_psnr:
+                best_psnr = current_psnr
+                trainer.save_best_model(epoch)
+                print(f"[*] New Best PSNR: {best_psnr:.3f} saved at Epoch {epoch + 1}")
 
 
 def test(config):
