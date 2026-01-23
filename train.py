@@ -2,6 +2,7 @@ import os
 import time
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import cv2
 import numpy as np
 from utils import Train_Report, TestReport, SaveManager
@@ -16,7 +17,7 @@ class Trainer:
         if self.config.save_train_img:
             self.save_manager = SaveManager(config)
 
-        # 损失函数
+        # 基础损失函数
         self.criterion = nn.L1Loss()
 
         # 学习率里程碑（Epochs）
@@ -48,6 +49,35 @@ class Trainer:
         self.model.cuda()
 
     # ----------------------------------------------------------------------
+    # 核心：智能盲元加权损失函数
+    # ----------------------------------------------------------------------
+    def smart_recon_loss(self, recon, target):
+        # 1. 计算基础偏差
+        abs_diff = torch.abs(recon - target)
+
+        with torch.no_grad():
+            # 2. 精准定位：锁定全图误差最大的前 0.5% 像素
+            flat_diff = abs_diff.view(-1)
+            k = int(flat_diff.numel() * 0.005)
+            threshold, _ = torch.topk(flat_diff, k)
+            min_topk_val = threshold[-1]
+            # 找到盲元候选掩码
+            blind_mask = (abs_diff >= min_topk_val).float()
+
+        # 3. 核心改变：对盲元点施加“生存级”权重 (1000倍)
+        # 并使用 L2 损失，因为 L2 对大误差的惩罚远超 L1
+        l1_loss = abs_diff
+        l2_loss = (recon - target) ** 2
+
+        # 组合策略：
+        # 背景区域使用标准的 L1 损失，维持平滑性。
+        # 盲元区域使用 1000 倍的 L2 损失，强制梯度爆炸式增长。
+        weighted_loss = torch.where(blind_mask > 0.5,
+                                    1000.0 * l2_loss,
+                                    1.0 * l1_loss)
+
+        return weighted_loss.mean()
+    # ----------------------------------------------------------------------
     # 核心训练逻辑
     # ----------------------------------------------------------------------
     def train(self, dataloader, train_log, global_step):
@@ -66,17 +96,20 @@ class Trainer:
             batch_size, _, t, _, _ = lr_blur_seq.shape
 
             if self.config.stage == 1:
-                # Stage 1: 仅训练退化支路
-                recon_loss = self.criterion(result_dict['recon'], lr_blur_seq[:, :, t // 2, :, :])
+                # --- 修改点 1: 使用自定义的智能加权重建损失 ---
+                recon_loss = self.smart_recon_loss(result_dict['recon'], lr_blur_seq[:, :, t // 2, :, :])
+
                 hr_warping_loss = self.config.hr_warping_loss_weight * self.criterion(
                     result_dict['hr_warp'],
                     hr_sharp_seq[:, :, t // 2:t // 2 + 1, :, :].repeat([1, 1, t, 1, 1])
                 )
-                # 修改为以下逻辑（处理维度不匹配）：
+
+                # --- 修改点 2: 大幅调高光流损失权重 (x10) ---
+                # 按照你的思路，先让模型通过强力的对齐发现“谁是静止盲元”
                 b, _, t, h, w = result_dict['image_flow'].size()
-                # 将 target flow 从 [B, 10, H, W] 重塑为 [B, 2, 5, H, W] 以匹配模型输出
                 target_flow = flow.view(b, 2, t, h, w)
-                flow_loss = self.config.flow_loss_weight * self.criterion(result_dict['image_flow'], target_flow)
+                flow_loss = 10.0 * self.config.flow_loss_weight * self.criterion(result_dict['image_flow'], target_flow)
+
                 D_TA_loss = self.config.D_TA_loss_weight * self.criterion(result_dict['F_sharp_D'], lr_sharp_seq)
 
                 total_loss = recon_loss + hr_warping_loss + flow_loss + D_TA_loss
@@ -91,8 +124,10 @@ class Trainer:
             elif self.config.stage == 2:
                 # Stage 2: 联合训练
                 restoration_loss = self.criterion(result_dict['output'], hr_sharp_seq[:, :, t // 2, :, :])
-                recon_loss = self.config.Net_D_weight * self.criterion(result_dict['recon'],
-                                                                       lr_blur_seq[:, :, t // 2, :, :])
+                # Stage 2 也同样应用 smart_recon_loss 以维持 Net_D 对盲元的敏感度
+                recon_loss = self.config.Net_D_weight * self.smart_recon_loss(result_dict['recon'],
+                                                                              lr_blur_seq[:, :, t // 2, :, :])
+
                 lr_warping_loss = self.config.lr_warping_loss_weight * self.criterion(
                     result_dict['lr_warp'],
                     lr_blur_seq[:, :, t // 2:t // 2 + 1, :, :].repeat([1, 1, t, 1, 1])
@@ -101,11 +136,12 @@ class Trainer:
                     result_dict['hr_warp'],
                     hr_sharp_seq[:, :, t // 2:t // 2 + 1, :, :].repeat([1, 1, t, 1, 1])
                 )
-                # --- 修正后的 Stage 2 光流 Loss ---
+
                 b, _, t, h, w = result_dict['image_flow'].size()
                 target_flow = flow.view(b, 2, t, h, w)
                 flow_loss = self.config.Net_D_weight * self.config.flow_loss_weight * self.criterion(
-                    result_dict['image_flow'], target_flow)  # 记得加上 target_flow
+                    result_dict['image_flow'], target_flow)
+
                 R_TA_loss = self.config.R_TA_loss_weight * self.criterion(result_dict['F_sharp_R'], lr_sharp_seq)
                 D_TA_loss = self.config.Net_D_weight * self.config.D_TA_loss_weight * self.criterion(
                     result_dict['F_sharp_D'], lr_sharp_seq)
@@ -143,9 +179,7 @@ class Trainer:
             self.scheduler_R.step()
         return global_step
 
-    # ----------------------------------------------------------------------
-    # 验证逻辑 (Validate)
-    # ----------------------------------------------------------------------
+    # --- 后面的 validate, test 等方法保持不变 ---
     def validate(self, dataloader, val_log, epoch):
         self.model.eval()
         report = Train_Report()
@@ -157,14 +191,11 @@ class Trainer:
                 if self.config.stage == 1:
                     report.update_recon_metric(result_dict['recon'], lr_blur_seq[:, :, lr_blur_seq.shape[2] // 2, :, :])
                 else:
-                    report.update_restoration_metric(result_dict['output'], hr_sharp_seq[:, :, hr_sharp_seq.shape[2] // 2, :, :])
-
+                    report.update_restoration_metric(result_dict['output'],
+                                                     hr_sharp_seq[:, :, hr_sharp_seq.shape[2] // 2, :, :])
         val_log.write(f"VAL Epoch [{epoch}]\t" + report.val_result_str(time.time() - start))
         return report.psnr if self.config.stage == 2 else report.recon_psnr
 
-    # ----------------------------------------------------------------------
-    # 测试逻辑 (Test)
-    # ----------------------------------------------------------------------
     def test(self, dataloader):
         self.model.eval()
         with torch.no_grad():
@@ -176,12 +207,11 @@ class Trainer:
                 path_info = relative_path[0]
                 save_fn = os.path.join(self.config.save_dir, 'test', path_info)
                 os.makedirs(os.path.dirname(save_fn), exist_ok=True)
-                output = output.squeeze()  # 变成 (H, W)
+                output = output.squeeze()
                 cv2.imwrite(save_fn, output)
 
     def test_quantitative_result(self, gt_dir, output_dir, image_border):
         report = TestReport()
-        # 注意：此处逻辑需根据你的 val_sharp 实际子目录结构微调
         scenes = sorted(os.listdir(output_dir))
         for scene in scenes:
             scene_path = os.path.join(output_dir, scene)
@@ -194,9 +224,6 @@ class Trainer:
                     report.update_metric(gt_img, out_img, img_name)
         report.print_final_result()
 
-    # ----------------------------------------------------------------------
-    # 权重管理
-    # ----------------------------------------------------------------------
     def save_checkpoint(self, epoch):
         save_dict = {
             'epoch': epoch,
@@ -206,7 +233,6 @@ class Trainer:
         if self.config.stage == 2:
             save_dict['model_R_state_dict'] = self.model.restoration_network.state_dict()
             save_dict['optimizer_R_state_dict'] = self.optimizer_R.state_dict()
-
         torch.save(save_dict, os.path.join(self.checkpoint_path, 'latest.pt'))
 
     def save_best_model(self, epoch):

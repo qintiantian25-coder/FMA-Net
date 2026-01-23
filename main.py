@@ -3,7 +3,7 @@ import torch
 # 1. 强制同步，报错位置会变得精确
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 # 2. 禁用 cuDNN 优化，避免黑盒算子错误
-torch.backends.cudnn.enabled = False
+torch.backends.cudnn.enabled = True
 torch.backends.cudnn.benchmark = False
 # 3. 针对 Blackwell 的特殊设置
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -50,21 +50,19 @@ def train(config):
         global_step = trainer.train(train_dataloader, train_log, global_step)
 
         if (epoch + 1) % config.val_period == 0 or epoch == config.num_epochs - 1:
-            # 传入统一后的变量名 val_dataloader
             val_result = trainer.validate(val_dataloader, val_log, epoch)
 
-            # 稳健地提取 PSNR 数值
-            if isinstance(val_result, list):
-                # 如果是 Stage 1，通常 Recon PSNR 是较大的那个数（80左右）
-                # 如果是 Stage 2，通常第一个数是修复 PSNR
-                if config.stage == 1:
-                    current_psnr = max(val_result) # Stage 1 取最高重建质量
-                else:
-                    current_psnr = val_result[0]   # Stage 2 取修复指标
+            # --- 修改建议：根据 Stage 稳健提取指标 ---
+            if isinstance(val_result, (list, tuple)):
+                current_psnr = val_result[0]  # 通常第一个是主要的 PSNR 指标
             else:
                 current_psnr = val_result
 
-            # 进行比较并保存最优模型
+            # 如果 PSNR 是 0 或 Inf，可能是数据问题，打印提醒
+            if np.isinf(current_psnr) or np.isnan(current_psnr):
+                print(f"[!] Warning: Invalid PSNR detected at Epoch {epoch + 1}")
+                continue
+
             if current_psnr > best_psnr:
                 best_psnr = current_psnr
                 trainer.save_best_model(epoch)
