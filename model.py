@@ -526,9 +526,11 @@ class Net_R(torch.nn.Module):
         bias = config.bias
         scale = config.scale
 
-        self.feature_extractor = nn.Sequential(nn.Conv3d(in_channels + dim, dim, kernel_size=[1, 3, 3], padding=[0, 1, 1], stride=1, bias=bias),
-                                               nn.LeakyReLU(negative_slope=0.2, inplace=True),
-                                               RRDB(dim=dim, num_RDB=num_RDB, growth_rate=growth_rate, num_dense_layer=num_dense_layer, bias=config.bias))
+        self.feature_extractor = nn.Sequential(
+            nn.Conv3d(config.in_channels + dim, dim, kernel_size=[1, 3, 3], padding=[0, 1, 1], stride=1, bias=bias),
+            nn.LeakyReLU(negative_slope=0.2, inplace=True),
+            RRDB(dim=dim, num_RDB=num_RDB, growth_rate=growth_rate, num_dense_layer=num_dense_layer, bias=config.bias)
+        )
 
         # FRMA blocks for restoration network
         self.FRMA_blocks = nn.ModuleList([FRMA(dim, num_seq, growth_rate, num_dense_layer, num_flow, num_transformer_block, num_heads, LayerNorm_type,
@@ -556,9 +558,12 @@ class Net_R(torch.nn.Module):
                                      nn.LeakyReLU(negative_slope=0.2, inplace=True),
                                      nn.Conv3d(3*num_flow, 3, kernel_size=[1, 3, 3], padding=[0, 1, 1], stride=1, bias=bias))
 
-        self.f_conv3 = nn.Sequential(nn.Conv3d(3*num_flow+3+3, 3*num_flow, kernel_size=[1, 3, 3], padding=[0, 1, 1], stride=1, bias=bias),
-                                     nn.LeakyReLU(negative_slope=0.2, inplace=True),
-                                     nn.Conv3d(3 * num_flow, 3, kernel_size=[1, 3, 3], padding=[0, 1, 1], stride=1, bias=bias))
+        self.f_conv3 = nn.Sequential(
+            nn.Conv3d(3 * num_flow + 1 + 1, 3 * num_flow, kernel_size=[1, 3, 3], padding=[0, 1, 1], stride=1,
+                      bias=bias),
+            nn.LeakyReLU(negative_slope=0.2, inplace=True),
+            nn.Conv3d(3 * num_flow, 3, kernel_size=[1, 3, 3], padding=[0, 1, 1], stride=1, bias=bias)
+        )
 
         self.bwarp = ImageBWarp(1, num_seq)
         self.duf = DynamicUpampling(us_kernel_size, scale)
@@ -594,11 +599,12 @@ class Net_R(torch.nn.Module):
         KR = rearrange(Fw, 'b (c t) h w -> b c t h w', t=T)
         KR = self.r_conv(KR)
 
-        # 建议：将中间变量改名，增加可读性并防止逻辑混淆
         f_X_initial = self.f_conv2(f)
         _, warped_X_pre = self.bwarp(x, f_X_initial)
-        f_X_final = self.f_conv3(
-            torch.cat([f, warped_X_pre, x[:, :, T // 2:T // 2 + 1, :, :].repeat([1, 1, T, 1, 1])], dim=1))
+
+        feat_to_cat = torch.cat([f, warped_X_pre, x[:, :, T // 2:T // 2 + 1, :, :].repeat([1, 1, T, 1, 1])], dim=1)
+
+        f_X_final = self.f_conv3(feat_to_cat)
         _, warped_X = self.bwarp(x, f_X_final)  # 最终对齐
         output = self.duf(warped_X, KR) + res
         anchor = self.a_conv(F)
@@ -646,4 +652,3 @@ class FMANet(torch.nn.Module):
             result_dict['F_sharp_R'] = anchor_R
 
             return result_dict
-
