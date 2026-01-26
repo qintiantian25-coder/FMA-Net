@@ -88,10 +88,12 @@ def test(config):
     output_root = os.path.join(config.save_dir, 'test') # 对应 Trainer.test 里的保存位置
 
     print("===> Starting Quantitative Evaluation...")
+    # 注意：如果你的 test_sharp 里没有子文件夹（全是图），
+    # 记得配合我之前建议你修改的那个“扁平化”版本的 test_quantitative_result
     trainer.test_quantitative_result(
         gt_dir=gt_root,
         output_dir=output_root,
-        image_border=config.num_seq // 2
+        image_border=0  # 盲元修复通常看全图，如果不需要裁边可以设为 0
     )
 
 
