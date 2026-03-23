@@ -40,6 +40,8 @@ class Config:
         self.D_TA_loss_weight = float(parser.get("training", "D_TA_loss_weight"))
         self.R_TA_loss_weight = float(parser.get("training", "R_TA_loss_weight"))
         self.Net_D_weight = float(parser.get("training", "Net_D_weight"))
+        # 盲元判定阈值：用于 stage-2 的 mask 监督与盲元区域对齐统计。
+        self.blind_mask_threshold = float(parser.get("training", "blind_mask_threshold", fallback="0.08"))
 
         self.gpu = parser.get("training", "gpu")
 

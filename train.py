@@ -70,6 +70,17 @@ class Trainer:
         x = (x * 255.0).round().to(torch.uint8).cpu().numpy()
         return x
 
+    def _build_blind_masks(self, lr_center, hr_center):
+        # 基于中心帧差异构造盲元/非盲元掩码，用于避免把污染区域当作监督目标。
+        if lr_center.shape[-2:] != hr_center.shape[-2:]:
+            hr_center = F.interpolate(hr_center, size=lr_center.shape[-2:], mode='bilinear', align_corners=False)
+
+        blind_thr = getattr(self.config, 'blind_mask_threshold', 0.08)
+        diff = torch.abs(lr_center - hr_center)
+        blind_mask = (diff >= blind_thr).float()
+        non_blind_mask = 1.0 - blind_mask
+        return blind_mask, non_blind_mask
+
     def _save_align_vis(self, epoch, idx, ref_seq, warped_seq):
         """保存一张对齐前后差分图，便于快速判断光流对齐是否有效。"""
         if ref_seq.shape[2] < 2:
@@ -125,6 +136,26 @@ class Trainer:
         after_l1 = torch.mean(torch.abs(warped_neighbors - center_rep))
         gain_pct = (before_l1 - after_l1) / (before_l1 + 1e-8) * 100.0
 
+        blind_before_l1 = None
+        blind_after_l1 = None
+        blind_gain_pct = None
+        blind_ratio = None
+
+        # Stage-2 重点指标：只在中心帧盲元区域评估对齐收益，区分“全图好看”与“修补区有效”。
+        if 'lr_warp' in result_dict:
+            center_lr = lr_blur_seq[:, :, c_idx:c_idx + 1, :, :]
+            center_hr = hr_sharp_seq[:, :, c_idx:c_idx + 1, :, :]
+            blind_mask, _ = self._build_blind_masks(center_lr, center_hr)
+            blind_ratio = blind_mask.mean().item()
+
+            blind_mask_rep = blind_mask.repeat(1, 1, len(nbr_idx), 1, 1)
+            blind_count = blind_mask_rep.sum()
+            if blind_count.item() > 0:
+                center_hr_rep = center_hr.repeat(1, 1, len(nbr_idx), 1, 1)
+                blind_before_l1 = (torch.abs(ref_neighbors - center_hr_rep) * blind_mask_rep).sum() / blind_count
+                blind_after_l1 = (torch.abs(warped_neighbors - center_hr_rep) * blind_mask_rep).sum() / blind_count
+                blind_gain_pct = (blind_before_l1 - blind_after_l1) / (blind_before_l1 + 1e-8) * 100.0
+
         epe = None
         if 'image_flow' in result_dict:
             pred_flow = result_dict['image_flow']
@@ -136,6 +167,10 @@ class Trainer:
             'after_l1': after_l1.item(),
             'gain_pct': gain_pct.item(),
             'epe': None if epe is None else epe.item(),
+            'blind_before_l1': None if blind_before_l1 is None else blind_before_l1.item(),
+            'blind_after_l1': None if blind_after_l1 is None else blind_after_l1.item(),
+            'blind_gain_pct': None if blind_gain_pct is None else blind_gain_pct.item(),
+            'blind_ratio': blind_ratio,
             'batch_size': ref_seq.shape[0],
             'ref_seq': ref_seq,
             'warped_seq': warped_seq
@@ -172,10 +207,20 @@ class Trainer:
                 restoration_loss = self.criterion(result_dict['output'], hr_sharp_seq[:, :, t // 2, :, :])
                 recon_loss = self.config.Net_D_weight * self.smart_recon_loss(result_dict['recon'],
                                                                               lr_blur_seq[:, :, t // 2, :, :])
-                lr_warping_loss = self.config.lr_warping_loss_weight * self.criterion(result_dict['lr_warp'],
-                                                                                      lr_blur_seq[:, :,
-                                                                                      t // 2:t // 2 + 1, :, :].repeat(
-                                                                                          [1, 1, t, 1, 1]))
+                # Stage-2: LR warp 仅在非盲元区域监督，避免将中心帧盲元污染反向灌输给对齐分支。
+                center_lr = lr_blur_seq[:, :, t // 2:t // 2 + 1, :, :]
+                center_hr = hr_sharp_seq[:, :, t // 2:t // 2 + 1, :, :]
+                _, non_blind_mask = self._build_blind_masks(center_lr, center_hr)
+                target_lr = center_lr.repeat([1, 1, t, 1, 1])
+                non_blind_mask_t = non_blind_mask.repeat([1, 1, t, 1, 1])
+                valid_non_blind = non_blind_mask_t.sum()
+
+                if valid_non_blind.item() > 0:
+                    masked_l1 = (torch.abs(result_dict['lr_warp'] - target_lr) * non_blind_mask_t).sum() / valid_non_blind
+                    lr_warping_loss = self.config.lr_warping_loss_weight * masked_l1
+                else:
+                    # 极端情况下（mask全0）回退到原始全图监督，保证训练稳定。
+                    lr_warping_loss = self.config.lr_warping_loss_weight * self.criterion(result_dict['lr_warp'], target_lr)
                 hr_warping_loss = self.config.Net_D_weight * self.config.hr_warping_loss_weight * self.criterion(
                     result_dict['hr_warp'], hr_sharp_seq[:, :, t // 2:t // 2 + 1, :, :].repeat([1, 1, t, 1, 1]))
 
@@ -223,6 +268,11 @@ class Trainer:
         align_epe_sum = 0.0
         align_count = 0
         epe_count = 0
+        blind_before_sum = 0.0
+        blind_after_sum = 0.0
+        blind_gain_sum = 0.0
+        blind_ratio_sum = 0.0
+        blind_count = 0
 
         with torch.no_grad():
             for idx, (lr_blur_seq, hr_sharp_seq, lr_sharp_seq, flow) in enumerate(dataloader):
@@ -246,6 +296,14 @@ class Trainer:
                         align_epe_sum += align_metrics['epe'] * bsz
                         epe_count += bsz
 
+                    # 盲元区域专用对齐统计：用于直接判断“可填补区域”的对齐是否真的在变好。
+                    if align_metrics['blind_before_l1'] is not None:
+                        blind_before_sum += align_metrics['blind_before_l1'] * bsz
+                        blind_after_sum += align_metrics['blind_after_l1'] * bsz
+                        blind_gain_sum += align_metrics['blind_gain_pct'] * bsz
+                        blind_ratio_sum += (align_metrics['blind_ratio'] or 0.0) * bsz
+                        blind_count += bsz
+
                     # 可选：每个验证 epoch 只保存首个 batch 的可视化，避免大量IO拖慢训练。
                     if getattr(self.config, 'save_val_align_vis', False) and idx == 0:
                         self._save_align_vis(epoch, idx, align_metrics['ref_seq'], align_metrics['warped_seq'])
@@ -258,6 +316,13 @@ class Trainer:
             align_msg = f"\tAlignBefore: {align_before:.6f}\tAlignAfter: {align_after:.6f}\tAlignGain(%): {align_gain:.3f}"
             if epe_count > 0:
                 align_msg += f"\tEPE: {align_epe_sum / epe_count:.6f}"
+            if blind_count > 0:
+                align_msg += (
+                    f"\tBlindRatio: {blind_ratio_sum / blind_count:.4f}"
+                    f"\tBlindAlignBefore: {blind_before_sum / blind_count:.6f}"
+                    f"\tBlindAlignAfter: {blind_after_sum / blind_count:.6f}"
+                    f"\tBlindAlignGain(%): {blind_gain_sum / blind_count:.3f}"
+                )
             log_msg += align_msg
 
         val_log.write(log_msg)
