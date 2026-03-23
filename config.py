@@ -61,6 +61,7 @@ class Config:
 
         # validation
         self.val_period = int(parser.get('validation', 'val_period'))
+        self.save_val_align_vis = parser.getboolean('validation', 'save_val_align_vis', fallback=False)
 
         # test
         self.custom_path = parser.get('test', 'custom_path')

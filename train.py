@@ -63,6 +63,84 @@ class Trainer:
         weighted_loss = torch.where(blind_mask > 0.5, 1000.0 * l2_loss, 1.0 * l1_loss)
         return weighted_loss.mean()
 
+    def _tensor_to_u8(self, x):
+        x = x.detach().float().clamp(0.0, 1.0)
+        if x.dim() == 3:
+            x = x[0]
+        x = (x * 255.0).round().to(torch.uint8).cpu().numpy()
+        return x
+
+    def _save_align_vis(self, epoch, idx, ref_seq, warped_seq):
+        """保存一张对齐前后差分图，便于快速判断光流对齐是否有效。"""
+        if ref_seq.shape[2] < 2:
+            return
+
+        t = ref_seq.shape[2]
+        c_idx = t // 2
+        n_idx = c_idx - 1 if c_idx > 0 else c_idx + 1
+
+        ref = ref_seq[0, :, n_idx, :, :]
+        warped = warped_seq[0, :, n_idx, :, :]
+        center = ref_seq[0, :, c_idx, :, :]
+
+        before_diff = torch.abs(ref - center)
+        after_diff = torch.abs(warped - center)
+
+        ref_img = self._tensor_to_u8(ref)
+        warped_img = self._tensor_to_u8(warped)
+        center_img = self._tensor_to_u8(center)
+        before_img = self._tensor_to_u8(before_diff)
+        after_img = self._tensor_to_u8(after_diff)
+
+        panel = np.concatenate([ref_img, warped_img, center_img, before_img, after_img], axis=1)
+        save_dir = os.path.join(self.config.save_dir, 'align_vis')
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, f'epoch{epoch + 1:04d}_iter{idx + 1:04d}.png')
+        cv2.imwrite(save_path, panel)
+
+    def _compute_align_metrics(self, result_dict, lr_blur_seq, hr_sharp_seq, flow):
+        """计算对齐前后误差、改进率和EPE。"""
+        if 'lr_warp' in result_dict:
+            ref_seq = lr_blur_seq
+            warped_seq = result_dict['lr_warp']
+        elif 'hr_warp' in result_dict:
+            ref_seq = hr_sharp_seq
+            warped_seq = result_dict['hr_warp']
+        else:
+            return None
+
+        t = ref_seq.shape[2]
+        c_idx = t // 2
+        nbr_idx = [i for i in range(t) if i != c_idx]
+        if len(nbr_idx) == 0:
+            return None
+
+        center = ref_seq[:, :, c_idx:c_idx + 1, :, :]
+        center_rep = center.repeat(1, 1, len(nbr_idx), 1, 1)
+
+        ref_neighbors = ref_seq[:, :, nbr_idx, :, :]
+        warped_neighbors = warped_seq[:, :, nbr_idx, :, :]
+
+        before_l1 = torch.mean(torch.abs(ref_neighbors - center_rep))
+        after_l1 = torch.mean(torch.abs(warped_neighbors - center_rep))
+        gain_pct = (before_l1 - after_l1) / (before_l1 + 1e-8) * 100.0
+
+        epe = None
+        if 'image_flow' in result_dict:
+            pred_flow = result_dict['image_flow']
+            gt_flow = flow.view_as(pred_flow)
+            epe = torch.norm(pred_flow - gt_flow, dim=1).mean()
+
+        return {
+            'before_l1': before_l1.item(),
+            'after_l1': after_l1.item(),
+            'gain_pct': gain_pct.item(),
+            'epe': None if epe is None else epe.item(),
+            'batch_size': ref_seq.shape[0],
+            'ref_seq': ref_seq,
+            'warped_seq': warped_seq
+        }
+
     def train(self, dataloader, train_log, global_step):
         self.model.train()
         report = Train_Report()
@@ -138,6 +216,14 @@ class Trainer:
         self.model.eval()
         report = Train_Report()
         start = time.time()
+
+        align_before_sum = 0.0
+        align_after_sum = 0.0
+        align_gain_sum = 0.0
+        align_epe_sum = 0.0
+        align_count = 0
+        epe_count = 0
+
         with torch.no_grad():
             for idx, (lr_blur_seq, hr_sharp_seq, lr_sharp_seq, flow) in enumerate(dataloader):
                 lr_blur_seq, hr_sharp_seq, lr_sharp_seq, flow = lr_blur_seq.cuda(), hr_sharp_seq.cuda(), lr_sharp_seq.cuda(), flow.cuda()
@@ -147,7 +233,34 @@ class Trainer:
                 else:
                     report.update_restoration_metric(result_dict['output'],
                                                      hr_sharp_seq[:, :, hr_sharp_seq.shape[2] // 2, :, :])
-        val_log.write(f"VAL Epoch [{epoch}]\t" + report.val_result_str(time.time() - start))
+
+                align_metrics = self._compute_align_metrics(result_dict, lr_blur_seq, hr_sharp_seq, flow)
+                if align_metrics is not None:
+                    bsz = align_metrics['batch_size']
+                    align_before_sum += align_metrics['before_l1'] * bsz
+                    align_after_sum += align_metrics['after_l1'] * bsz
+                    align_gain_sum += align_metrics['gain_pct'] * bsz
+                    align_count += bsz
+
+                    if align_metrics['epe'] is not None:
+                        align_epe_sum += align_metrics['epe'] * bsz
+                        epe_count += bsz
+
+                    # 可选：每个验证 epoch 只保存首个 batch 的可视化，避免大量IO拖慢训练。
+                    if getattr(self.config, 'save_val_align_vis', False) and idx == 0:
+                        self._save_align_vis(epoch, idx, align_metrics['ref_seq'], align_metrics['warped_seq'])
+
+        log_msg = f"VAL Epoch [{epoch}]\t" + report.val_result_str(time.time() - start)
+        if align_count > 0:
+            align_before = align_before_sum / align_count
+            align_after = align_after_sum / align_count
+            align_gain = align_gain_sum / align_count
+            align_msg = f"\tAlignBefore: {align_before:.6f}\tAlignAfter: {align_after:.6f}\tAlignGain(%): {align_gain:.3f}"
+            if epe_count > 0:
+                align_msg += f"\tEPE: {align_epe_sum / epe_count:.6f}"
+            log_msg += align_msg
+
+        val_log.write(log_msg)
         return report.psnr if self.config.stage == 2 else report.recon_psnr
 
     def test(self, dataloader):

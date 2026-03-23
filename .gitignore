@@ -1,0 +1,15 @@
+.idea/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 忽略数据集文件夹（这是导致你文件变动上万的核心原因）
+data/
+results/
+
+# 忽略训练日志和权重
+experiments/
+lightning_logs/
+*.pth
+*.ckpt
