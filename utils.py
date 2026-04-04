@@ -28,6 +28,20 @@ def denorm(x):
 # --------------------------------------------
 def RGB_PSNR(img1, img2, border=0):
     """适配灰度图与彩色图的 PSNR 计算"""
+    # Fast path: keep tensor math on device to avoid CPU sync/NumPy conversion in val loop.
+    if torch.is_tensor(img1) and torch.is_tensor(img2):
+        if img1.shape != img2.shape:
+            raise ValueError(f'Input images must have the same dimensions. {img1.shape} vs {img2.shape}')
+        if border > 0:
+            img1 = img1[..., border:-border, border:-border]
+            img2 = img2[..., border:-border, border:-border]
+        img1 = img1.float()
+        img2 = img2.float()
+        mse = torch.mean(((img1 * 255.0) - (img2 * 255.0)) ** 2)
+        if mse.item() == 0:
+            return float('inf')
+        return float(20.0 * torch.log10(torch.tensor(255.0, device=img1.device) / torch.sqrt(mse)).item())
+
     # 如果输入是 Tensor，先转 numpy 并去掉 batch/channel 维度
     if torch.is_tensor(img1):
         img1 = img1.squeeze().cpu().detach().numpy()

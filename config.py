@@ -26,6 +26,12 @@ class Config:
         self.nThreads = int(parser.get("training", "nThreads"))
         self.num_epochs = int(parser.get("training", "num_epochs"))
         self.lr = float(parser.get("training", "lr"))
+        # Optional one-shot LR switch: keep one-command training from start to finish.
+        self.lr_drop_epoch = int(parser.get("training", "lr_drop_epoch", fallback="-1"))
+        self.lr_after_drop = float(parser.get("training", "lr_after_drop", fallback="0"))
+        # Dynamic LR mode: keep base LR before drop epoch, then decay automatically (cosine) afterwards.
+        self.lr_dynamic_after_drop = parser.getboolean("training", "lr_dynamic_after_drop", fallback=False)
+        self.dynamic_min_lr = float(parser.get("training", "dynamic_min_lr", fallback="1e-6"))
         self.batch_size = int(parser.get('training', 'batch_size'))
         self.patch_size = int(parser.get('training', 'patch_size'))
         self.finetuning = (parser.get('training', 'finetuning') == 'True')
@@ -42,8 +48,37 @@ class Config:
         self.Net_D_weight = float(parser.get("training", "Net_D_weight"))
         # 盲元判定阈值：用于 stage-2 的 mask 监督与盲元区域对齐统计。
         self.blind_mask_threshold = float(parser.get("training", "blind_mask_threshold", fallback="0.08"))
+        # Stage-2 盲元专项分支损失权重：仅对盲元掩码区域生效。
+        self.blind_restore_loss_weight = float(parser.get("training", "blind_restore_loss_weight", fallback="0.2"))
+        # 盲元专项残差分支的输出缩放，便于平衡全图稳定性与盲元修补力度。
+        self.blind_res_scale = float(parser.get("training", "blind_res_scale", fallback="1.0"))
+        # 推理时无GT，使用中心帧阈值近似盲元区域。
+        self.blind_infer_threshold = float(parser.get("training", "blind_infer_threshold", fallback="0.08"))
+        # 模型保存判定中的主指标容差与盲元兜底容差。
+        self.checkpoint_psnr_tolerance = float(parser.get("training", "checkpoint_psnr_tolerance", fallback="1e-4"))
+        self.checkpoint_blind_l1_tolerance = float(parser.get("training", "checkpoint_blind_l1_tolerance", fallback="1e-6"))
 
         self.gpu = parser.get("training", "gpu")
+
+        # Performance knobs: all have safe fallbacks so old cfg files keep working.
+        self.use_amp = parser.getboolean('training', 'use_amp', fallback=True)
+        self.amp_dtype = parser.get('training', 'amp_dtype', fallback='fp16')
+        self.cudnn_benchmark = parser.getboolean('training', 'cudnn_benchmark', fallback=True)
+        self.cuda_launch_blocking = parser.getboolean('training', 'cuda_launch_blocking', fallback=False)
+        self.pin_memory = parser.getboolean('training', 'pin_memory', fallback=True)
+        self.persistent_workers = parser.getboolean('training', 'persistent_workers', fallback=True)
+        self.prefetch_factor = int(parser.get('training', 'prefetch_factor', fallback='2'))
+        # Stability knobs: keep defaults backward-compatible while allowing NaN/overflow mitigation.
+        self.grad_clip_norm = float(parser.get('training', 'grad_clip_norm', fallback='0.0'))
+        self.amp_init_scale = float(parser.get('training', 'amp_init_scale', fallback='65536'))
+        self.amp_growth_interval = int(parser.get('training', 'amp_growth_interval', fallback='2000'))
+        self.amp_backoff_factor = float(parser.get('training', 'amp_backoff_factor', fallback='0.5'))
+        self.overflow_patience = int(parser.get('training', 'overflow_patience', fallback='2'))
+        self.lr_overflow_decay = float(parser.get('training', 'lr_overflow_decay', fallback='0.5'))
+        self.min_lr = float(parser.get('training', 'min_lr', fallback='1e-6'))
+        self.overflow_lr_decay_cooldown = int(parser.get('training', 'overflow_lr_decay_cooldown', fallback='200'))
+        self.overflow_log_interval = int(parser.get('training', 'overflow_log_interval', fallback='50'))
+        self.amp_recovery_steps = int(parser.get('training', 'amp_recovery_steps', fallback='128'))
 
         # Network
         self.in_channels = int(parser.get('network', 'in_channels'))
@@ -64,8 +99,13 @@ class Config:
         # validation
         self.val_period = int(parser.get('validation', 'val_period'))
         self.save_val_align_vis = parser.getboolean('validation', 'save_val_align_vis', fallback=False)
+        self.enable_align_metrics = parser.getboolean('validation', 'enable_align_metrics', fallback=True)
+        self.align_metrics_period = int(parser.get('validation', 'align_metrics_period', fallback='1'))
 
         # test
-        self.custom_path = parser.get('test', 'custom_path')
+        # custom_path is optional in some cfg files; keep empty when not provided.
+        self.custom_path = parser.get('test', 'custom_path', fallback='')
+        # 测试期盲元坐标文件（可选），用于盲元专项定量评估。
+        self.test_mask_csv = parser.get('test', 'test_mask_csv', fallback='')
 
         self.need_patch = (parser.get('training', 'need_patch') == 'True')

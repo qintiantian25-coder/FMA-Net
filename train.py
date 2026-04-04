@@ -1,5 +1,7 @@
 import os
 import time
+import csv
+from contextlib import nullcontext
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -21,17 +23,48 @@ class Trainer:
         # 基础损失函数
         self.criterion = nn.L1Loss()
 
-        # 学习率里程碑（Epochs）
-        milestones = [260, 360, 380, 390]
+        # 学习率调度：
+        # 1) 若开启动态模式：drop_epoch前保持base lr，之后自动cosine衰减到dynamic_min_lr。
+        # 2) 否则保持原有策略（单次降lr或默认多里程碑）。
+        default_milestones = [260, 360, 380, 390]
+        milestones = default_milestones
+        gamma = 0.5
+        use_dynamic_after_drop = bool(getattr(self.config, 'lr_dynamic_after_drop', False))
+        lr_drop_epoch = int(getattr(self.config, 'lr_drop_epoch', -1))
+        lr_after_drop = float(getattr(self.config, 'lr_after_drop', 0.0))
+
+        if use_dynamic_after_drop and lr_drop_epoch > 0 and self.config.num_epochs > lr_drop_epoch and self.config.lr > 0:
+            start_lr = lr_after_drop if lr_after_drop > 0 else self.config.lr
+            min_lr = float(getattr(self.config, 'dynamic_min_lr', 1e-6))
+            start_factor = max(1e-8, min(1.0, start_lr / self.config.lr))
+            min_factor = max(1e-8, min(start_factor, min_lr / self.config.lr))
+            denom = max(1, self.config.num_epochs - lr_drop_epoch - 1)
+
+            def _lr_lambda(epoch_idx):
+                # epoch_idx是scheduler内部已完成的epoch计数；这样可保证drop前训练轮次保持固定学习率。
+                if epoch_idx < lr_drop_epoch:
+                    return 1.0
+                t = min(1.0, max(0.0, (epoch_idx - lr_drop_epoch) / denom))
+                return float(min_factor + 0.5 * (start_factor - min_factor) * (1.0 + np.cos(np.pi * t)))
+
+            self._lr_scheduler_dynamic = True
+        else:
+            self._lr_scheduler_dynamic = False
+            if lr_drop_epoch > 0 and lr_after_drop > 0 and self.config.lr > 0:
+                milestones = [lr_drop_epoch]
+                gamma = max(1e-8, min(1.0, lr_after_drop / self.config.lr))
 
         # 优化器与调度器：退化学习网络 (Net_D)
         self.optimizer_D = torch.optim.Adam(
             self.model.degradation_learning_network.parameters(),
             lr=self.config.lr
         )
-        self.scheduler_D = torch.optim.lr_scheduler.MultiStepLR(
-            self.optimizer_D, milestones=milestones, gamma=0.5
-        )
+        if self._lr_scheduler_dynamic:
+            self.scheduler_D = torch.optim.lr_scheduler.LambdaLR(self.optimizer_D, lr_lambda=_lr_lambda)
+        else:
+            self.scheduler_D = torch.optim.lr_scheduler.MultiStepLR(
+                self.optimizer_D, milestones=milestones, gamma=gamma
+            )
 
         # 优化器与调度器：恢复网络 (Net_R) - 仅在 Stage 2 开启
         if self.config.stage == 2:
@@ -39,9 +72,12 @@ class Trainer:
                 self.model.restoration_network.parameters(),
                 lr=self.config.lr
             )
-            self.scheduler_R = torch.optim.lr_scheduler.MultiStepLR(
-                self.optimizer_R, milestones=milestones, gamma=0.5
-            )
+            if self._lr_scheduler_dynamic:
+                self.scheduler_R = torch.optim.lr_scheduler.LambdaLR(self.optimizer_R, lr_lambda=_lr_lambda)
+            else:
+                self.scheduler_R = torch.optim.lr_scheduler.MultiStepLR(
+                    self.optimizer_R, milestones=milestones, gamma=gamma
+                )
 
         # 权重保存路径
         self.checkpoint_path = os.path.join(self.config.save_dir, f'model_stage{self.config.stage}')
@@ -49,17 +85,122 @@ class Trainer:
 
         self.model.cuda()
 
+        # fast:Mixed precision can significantly improve throughput on modern GPUs.
+        self.use_amp = bool(getattr(self.config, 'use_amp', True))
+        amp_dtype = str(getattr(self.config, 'amp_dtype', 'fp16')).lower()
+        self.amp_dtype = torch.bfloat16 if amp_dtype == 'bf16' else torch.float16
+        self.scaler = torch.amp.GradScaler(
+            'cuda',
+            enabled=self.use_amp,
+            init_scale=float(getattr(self.config, 'amp_init_scale', 65536.0)),
+            growth_interval=int(getattr(self.config, 'amp_growth_interval', 2000)),
+            backoff_factor=float(getattr(self.config, 'amp_backoff_factor', 0.5))
+        )
+
+        # Stability-first knobs: these protect long stage-2 training from late-epoch NaN divergence.
+        self.grad_clip_norm = float(getattr(self.config, 'grad_clip_norm', 0.0))
+        self.overflow_patience = int(getattr(self.config, 'overflow_patience', 2))
+        self.lr_overflow_decay = float(getattr(self.config, 'lr_overflow_decay', 0.5))
+        self.min_lr = float(getattr(self.config, 'min_lr', 1e-6))
+        self.overflow_lr_decay_cooldown = int(getattr(self.config, 'overflow_lr_decay_cooldown', 200))
+        self.overflow_log_interval = int(getattr(self.config, 'overflow_log_interval', 50))
+        self.amp_recovery_steps = int(getattr(self.config, 'amp_recovery_steps', 128))
+        self.overflow_streak = 0
+        self.skipped_non_finite = 0
+        self.force_fp32_steps = 0
+        self.last_lr_decay_step = -10 ** 9
+        self.last_overflow_log_step = -10 ** 9
+
+    def _clip_gradients(self):
+        if self.grad_clip_norm <= 0:
+            return
+        nn.utils.clip_grad_norm_(self.model.degradation_learning_network.parameters(), self.grad_clip_norm)
+        if self.config.stage == 2:
+            nn.utils.clip_grad_norm_(self.model.restoration_network.parameters(), self.grad_clip_norm)
+
+    def _all_grads_finite(self):
+        modules = [self.model.degradation_learning_network]
+        if self.config.stage == 2:
+            modules.append(self.model.restoration_network)
+
+        for module in modules:
+            for p in module.parameters():
+                if p.grad is None:
+                    continue
+                if not torch.isfinite(p.grad).all():
+                    return False
+        return True
+
+    def _decay_optimizer_lr(self, optimizer):
+        changed = False
+        for group in optimizer.param_groups:
+            current_lr = group['lr']
+            new_lr = max(self.min_lr, current_lr * self.lr_overflow_decay)
+            if new_lr < current_lr:
+                changed = True
+            group['lr'] = new_lr
+        return changed
+
+    def _handle_overflow(self, train_log, global_step, reason):
+        self.overflow_streak += 1
+        self.skipped_non_finite += 1
+
+        should_log = (global_step - self.last_overflow_log_step) >= self.overflow_log_interval
+        if self.overflow_streak < self.overflow_patience:
+            if should_log:
+                train_log.write(
+                    f"[Stability] step={global_step} reason={reason} "
+                    f"overflow_streak={self.overflow_streak}/{self.overflow_patience}"
+                )
+                self.last_overflow_log_step = global_step
+            return
+
+        can_decay = (global_step - self.last_lr_decay_step) >= self.overflow_lr_decay_cooldown
+        lr_changed = False
+        if can_decay:
+            lr_changed = self._decay_optimizer_lr(self.optimizer_D)
+            if self.config.stage == 2:
+                lr_changed = self._decay_optimizer_lr(self.optimizer_R) or lr_changed
+            if lr_changed:
+                self.last_lr_decay_step = global_step
+
+        if should_log or lr_changed:
+            lr_d = self.optimizer_D.param_groups[0]['lr']
+            lr_r = self.optimizer_R.param_groups[0]['lr'] if self.config.stage == 2 else 0.0
+            msg = (
+                f"[Stability] step={global_step} reason={reason} overflow_streak={self.overflow_streak} "
+                f"-> LR_D={lr_d:.7f}, LR_R={lr_r:.7f}"
+            )
+            if not can_decay:
+                msg += f" (decay_cooldown={self.overflow_lr_decay_cooldown})"
+            elif not lr_changed:
+                msg += " (already_at_min_lr)"
+            train_log.write(msg)
+            self.last_overflow_log_step = global_step
+
+        self.overflow_streak = 0
+
+    def _is_finite_result(self, result_dict):
+        for value in result_dict.values():
+            if torch.is_tensor(value) and not torch.isfinite(value).all():
+                return False
+        return True
+
     def smart_recon_loss(self, recon, target):
-        abs_diff = torch.abs(recon - target)
+        # Run hard blind-pixel weighting in fp32 to reduce overflow risk under AMP.
+        recon_f = recon.float()
+        target_f = target.float()
+        abs_diff = torch.abs(recon_f - target_f)
         with torch.no_grad():
             flat_diff = abs_diff.view(-1)
-            k = int(flat_diff.numel() * 0.005)
-            threshold, _ = torch.topk(flat_diff, k)
-            min_topk_val = threshold[-1]
+            # fast2:kthvalue is cheaper than topk for obtaining only the threshold.
+            k = max(1, int(flat_diff.numel() * 0.005))
+            kth = max(1, flat_diff.numel() - k + 1)
+            min_topk_val = torch.kthvalue(flat_diff, kth).values
             blind_mask = (abs_diff >= min_topk_val).float()
 
         l1_loss = abs_diff
-        l2_loss = (recon - target) ** 2
+        l2_loss = (recon_f - target_f) ** 2
         weighted_loss = torch.where(blind_mask > 0.5, 1000.0 * l2_loss, 1.0 * l1_loss)
         return weighted_loss.mean()
 
@@ -182,70 +323,183 @@ class Trainer:
         start = time.time()
 
         for idx, (lr_blur_seq, hr_sharp_seq, lr_sharp_seq, flow) in enumerate(dataloader):
-            lr_blur_seq, hr_sharp_seq, lr_sharp_seq, flow = lr_blur_seq.cuda(), hr_sharp_seq.cuda(), lr_sharp_seq.cuda(), flow.cuda()
-            result_dict = self.model(lr_blur_seq, hr_sharp_seq)
+            lr_blur_seq = lr_blur_seq.cuda(non_blocking=True)
+            hr_sharp_seq = hr_sharp_seq.cuda(non_blocking=True)
+            lr_sharp_seq = lr_sharp_seq.cuda(non_blocking=True)
+            flow = flow.cuda(non_blocking=True)
             batch_size, _, t, _, _ = lr_blur_seq.shape
 
-            if self.config.stage == 1:
-                recon_loss = self.smart_recon_loss(result_dict['recon'], lr_blur_seq[:, :, t // 2, :, :])
-                hr_warping_loss = self.config.hr_warping_loss_weight * self.criterion(
-                    result_dict['hr_warp'], hr_sharp_seq[:, :, t // 2:t // 2 + 1, :, :].repeat([1, 1, t, 1, 1]))
+            # Stage-2 uses an explicit blind mask from GT difference; stage-1 keeps original forward.
+            blind_mask = None
+            if self.config.stage == 2:
+                center_lr_for_mask = lr_blur_seq[:, :, t // 2:t // 2 + 1, :, :]
+                center_hr_for_mask = hr_sharp_seq[:, :, t // 2:t // 2 + 1, :, :]
+                blind_mask, _ = self._build_blind_masks(center_lr_for_mask, center_hr_for_mask)
 
-                b, _, t, h, w = result_dict['image_flow'].size()
-                flow_loss = 10.0 * self.config.flow_loss_weight * self.criterion(result_dict['image_flow'],
-                                                                                 flow.view(b, 2, t, h, w))
-                D_TA_loss = self.config.D_TA_loss_weight * self.criterion(result_dict['F_sharp_D'], lr_sharp_seq)
+            amp_enabled = self.use_amp and self.force_fp32_steps <= 0
+            amp_ctx = torch.amp.autocast('cuda', dtype=self.amp_dtype) if amp_enabled else nullcontext()
+            with amp_ctx:
+                result_dict = self.model(lr_blur_seq, hr_sharp_seq, blind_mask=blind_mask)
 
-                total_loss = recon_loss + hr_warping_loss + flow_loss + D_TA_loss
-                self.optimizer_D.zero_grad(set_to_none=True)
-                total_loss.backward()
-                self.optimizer_D.step()
-                report.update(batch_size, 0, recon_loss.item(), hr_warping_loss.item(), 0, flow_loss.item(),
-                              D_TA_loss.item(), 0, total_loss.item())
+                if not self._is_finite_result(result_dict):
+                    if amp_enabled:
+                        self.force_fp32_steps = max(self.force_fp32_steps, self.amp_recovery_steps)
+                    self.optimizer_D.zero_grad(set_to_none=True)
+                    if self.config.stage == 2:
+                        self.optimizer_R.zero_grad(set_to_none=True)
+                    self._handle_overflow(train_log, global_step, 'non_finite_model_output')
+                    global_step += 1
+                    continue
 
-            elif self.config.stage == 2:
-                restoration_loss = self.criterion(result_dict['output'], hr_sharp_seq[:, :, t // 2, :, :])
-                recon_loss = self.config.Net_D_weight * self.smart_recon_loss(result_dict['recon'],
-                                                                              lr_blur_seq[:, :, t // 2, :, :])
-                # Stage-2: LR warp 仅在非盲元区域监督，避免将中心帧盲元污染反向灌输给对齐分支。
-                center_lr = lr_blur_seq[:, :, t // 2:t // 2 + 1, :, :]
-                center_hr = hr_sharp_seq[:, :, t // 2:t // 2 + 1, :, :]
-                _, non_blind_mask = self._build_blind_masks(center_lr, center_hr)
-                target_lr = center_lr.repeat([1, 1, t, 1, 1])
-                non_blind_mask_t = non_blind_mask.repeat([1, 1, t, 1, 1])
-                valid_non_blind = non_blind_mask_t.sum()
+                if self.force_fp32_steps > 0:
+                    self.force_fp32_steps -= 1
 
-                if valid_non_blind.item() > 0:
-                    masked_l1 = (torch.abs(result_dict['lr_warp'] - target_lr) * non_blind_mask_t).sum() / valid_non_blind
+                if self.config.stage == 1:
+                    recon_loss = self.smart_recon_loss(result_dict['recon'], lr_blur_seq[:, :, t // 2, :, :])
+                    center_hr = hr_sharp_seq[:, :, t // 2:t // 2 + 1, :, :]
+                    hr_target = center_hr.expand(-1, -1, t, -1, -1)
+                    hr_warping_loss = self.config.hr_warping_loss_weight * self.criterion(result_dict['hr_warp'].float(), hr_target.float())
+
+                    b, _, t, h, w = result_dict['image_flow'].size()
+                    flow_loss = 10.0 * self.config.flow_loss_weight * self.criterion(
+                        result_dict['image_flow'].float(), flow.view(b, 2, t, h, w).float()
+                    )
+                    D_TA_loss = self.config.D_TA_loss_weight * self.criterion(result_dict['F_sharp_D'].float(), lr_sharp_seq.float())
+
+                    total_loss = recon_loss + hr_warping_loss + flow_loss + D_TA_loss
+                    self.optimizer_D.zero_grad(set_to_none=True)
+                    if not torch.isfinite(total_loss):
+                        self.optimizer_D.zero_grad(set_to_none=True)
+                        if amp_enabled:
+                            self.force_fp32_steps = max(self.force_fp32_steps, self.amp_recovery_steps)
+                        self._handle_overflow(train_log, global_step, 'non_finite_loss_stage1')
+                        global_step += 1
+                        continue
+
+                    if amp_enabled:
+                        prev_scale = self.scaler.get_scale()
+                        self.scaler.scale(total_loss).backward()
+                        self.scaler.unscale_(self.optimizer_D)
+                        self._clip_gradients()
+                        if not self._all_grads_finite():
+                            self.optimizer_D.zero_grad(set_to_none=True)
+                            self.scaler.update()
+                            self._handle_overflow(train_log, global_step, 'non_finite_grad_stage1')
+                            global_step += 1
+                            continue
+                        self.scaler.step(self.optimizer_D)
+                        self.scaler.update()
+                        if self.scaler.get_scale() < prev_scale:
+                            self._handle_overflow(train_log, global_step, 'amp_overflow_stage1')
+                        else:
+                            self.overflow_streak = 0
+                    else:
+                        total_loss.backward()
+                        self._clip_gradients()
+                        if not self._all_grads_finite():
+                            self.optimizer_D.zero_grad(set_to_none=True)
+                            self._handle_overflow(train_log, global_step, 'non_finite_grad_stage1')
+                            global_step += 1
+                            continue
+                        self.optimizer_D.step()
+                        self.overflow_streak = 0
+
+                    report.update(batch_size, 0, recon_loss.item(), hr_warping_loss.item(), 0, flow_loss.item(),
+                                  D_TA_loss.item(), 0, total_loss.item())
+
+                elif self.config.stage == 2:
+                    center_hr_2d = hr_sharp_seq[:, :, t // 2, :, :]
+                    restoration_loss = self.criterion(result_dict['output'].float(), center_hr_2d.float())
+                    recon_loss = self.config.Net_D_weight * self.smart_recon_loss(
+                        result_dict['recon'], lr_blur_seq[:, :, t // 2, :, :]
+                    )
+
+                    # Compute masked losses with clamped denominators to avoid CPU sync via .item().
+                    blind_mask_2d = blind_mask[:, :, 0, :, :]
+                    blind_pixels = blind_mask_2d.sum().clamp_min(1.0)
+                    blind_l1 = (torch.abs(result_dict['output'].float() - center_hr_2d.float()) * blind_mask_2d.float()).sum() / blind_pixels
+                    blind_restore_loss = self.config.blind_restore_loss_weight * blind_l1
+
+                    center_lr = lr_blur_seq[:, :, t // 2:t // 2 + 1, :, :]
+                    non_blind_mask = 1.0 - blind_mask
+                    target_lr = center_lr.expand(-1, -1, t, -1, -1)
+                    non_blind_mask_t = non_blind_mask.expand(-1, -1, t, -1, -1)
+                    valid_non_blind = non_blind_mask_t.sum().clamp_min(1.0)
+                    masked_l1 = (torch.abs(result_dict['lr_warp'].float() - target_lr.float()) * non_blind_mask_t.float()).sum() / valid_non_blind
                     lr_warping_loss = self.config.lr_warping_loss_weight * masked_l1
-                else:
-                    # 极端情况下（mask全0）回退到原始全图监督，保证训练稳定。
-                    lr_warping_loss = self.config.lr_warping_loss_weight * self.criterion(result_dict['lr_warp'], target_lr)
-                hr_warping_loss = self.config.Net_D_weight * self.config.hr_warping_loss_weight * self.criterion(
-                    result_dict['hr_warp'], hr_sharp_seq[:, :, t // 2:t // 2 + 1, :, :].repeat([1, 1, t, 1, 1]))
 
-                b, _, t, h, w = result_dict['image_flow'].size()
-                flow_loss = self.config.Net_D_weight * self.config.flow_loss_weight * self.criterion(
-                    result_dict['image_flow'], flow.view(b, 2, t, h, w))
-                R_TA_loss = self.config.R_TA_loss_weight * self.criterion(result_dict['F_sharp_R'], lr_sharp_seq)
-                D_TA_loss = self.config.Net_D_weight * self.config.D_TA_loss_weight * self.criterion(
-                    result_dict['F_sharp_D'], lr_sharp_seq)
+                    hr_target = hr_sharp_seq[:, :, t // 2:t // 2 + 1, :, :].expand(-1, -1, t, -1, -1)
+                    hr_warping_loss = self.config.Net_D_weight * self.config.hr_warping_loss_weight * self.criterion(
+                        result_dict['hr_warp'].float(), hr_target.float()
+                    )
 
-                total_loss = restoration_loss + recon_loss + hr_warping_loss + lr_warping_loss + flow_loss + R_TA_loss + D_TA_loss
-                self.optimizer_D.zero_grad(set_to_none=True)
-                self.optimizer_R.zero_grad(set_to_none=True)
-                total_loss.backward()
-                self.optimizer_D.step()
-                self.optimizer_R.step()
-                report.update(batch_size, restoration_loss.item(), recon_loss.item(), hr_warping_loss.item(),
-                              lr_warping_loss.item(), flow_loss.item(), D_TA_loss.item(), R_TA_loss.item(),
-                              total_loss.item())
+                    b, _, t, h, w = result_dict['image_flow'].size()
+                    flow_loss = self.config.Net_D_weight * self.config.flow_loss_weight * self.criterion(
+                        result_dict['image_flow'].float(), flow.view(b, 2, t, h, w).float()
+                    )
+                    R_TA_loss = self.config.R_TA_loss_weight * self.criterion(result_dict['F_sharp_R'].float(), lr_sharp_seq.float())
+                    D_TA_loss = self.config.Net_D_weight * self.config.D_TA_loss_weight * self.criterion(
+                        result_dict['F_sharp_D'].float(), lr_sharp_seq.float()
+                    )
+
+                    total_loss = restoration_loss + blind_restore_loss + recon_loss + hr_warping_loss + lr_warping_loss + flow_loss + R_TA_loss + D_TA_loss
+                    self.optimizer_D.zero_grad(set_to_none=True)
+                    self.optimizer_R.zero_grad(set_to_none=True)
+                    if not torch.isfinite(total_loss):
+                        self.optimizer_D.zero_grad(set_to_none=True)
+                        self.optimizer_R.zero_grad(set_to_none=True)
+                        if amp_enabled:
+                            self.force_fp32_steps = max(self.force_fp32_steps, self.amp_recovery_steps)
+                        self._handle_overflow(train_log, global_step, 'non_finite_loss_stage2')
+                        global_step += 1
+                        continue
+
+                    if amp_enabled:
+                        prev_scale = self.scaler.get_scale()
+                        self.scaler.scale(total_loss).backward()
+                        self.scaler.unscale_(self.optimizer_D)
+                        self.scaler.unscale_(self.optimizer_R)
+                        self._clip_gradients()
+                        if not self._all_grads_finite():
+                            self.optimizer_D.zero_grad(set_to_none=True)
+                            self.optimizer_R.zero_grad(set_to_none=True)
+                            self.scaler.update()
+                            self._handle_overflow(train_log, global_step, 'non_finite_grad_stage2')
+                            global_step += 1
+                            continue
+                        self.scaler.step(self.optimizer_D)
+                        self.scaler.step(self.optimizer_R)
+                        self.scaler.update()
+                        if self.scaler.get_scale() < prev_scale:
+                            self._handle_overflow(train_log, global_step, 'amp_overflow_stage2')
+                        else:
+                            self.overflow_streak = 0
+                    else:
+                        total_loss.backward()
+                        self._clip_gradients()
+                        if not self._all_grads_finite():
+                            self.optimizer_D.zero_grad(set_to_none=True)
+                            self.optimizer_R.zero_grad(set_to_none=True)
+                            self._handle_overflow(train_log, global_step, 'non_finite_grad_stage2')
+                            global_step += 1
+                            continue
+                        self.optimizer_D.step()
+                        self.optimizer_R.step()
+                        self.overflow_streak = 0
+
+                    report.update(batch_size, restoration_loss.item(), recon_loss.item(), hr_warping_loss.item(),
+                                  lr_warping_loss.item(), flow_loss.item(), D_TA_loss.item(), R_TA_loss.item(),
+                                  total_loss.item())
 
             global_step += 1
             if global_step % 100 == 0 or idx == len(dataloader) - 1:
                 lr_D = self.optimizer_D.param_groups[0]['lr']
                 lr_R = self.optimizer_R.param_groups[0]['lr'] if self.config.stage == 2 else 0.0
                 train_log.write(f"[{global_step}]\t" + report.result_str(lr_D, lr_R, time.time() - start))
+                if self.skipped_non_finite > 0:
+                    train_log.write(f"[Stability] skipped_non_finite_steps={self.skipped_non_finite}")
+                if self.force_fp32_steps > 0:
+                    train_log.write(f"[Stability] temporary_fp32_steps_left={self.force_fp32_steps}")
                 start = time.time()
                 if self.config.save_train_img:
                     src = [lr_blur_seq[:, :, t // 2, :, :], result_dict['recon']]
@@ -262,6 +516,10 @@ class Trainer:
         report = Train_Report()
         start = time.time()
 
+        # Heavy alignment metrics can be computed less frequently than base val metrics.
+        align_period = max(1, int(getattr(self.config, 'align_metrics_period', 1)))
+        compute_align_metrics = bool(getattr(self.config, 'enable_align_metrics', True)) and ((epoch + 1) % align_period == 0)
+
         align_before_sum = 0.0
         align_after_sum = 0.0
         align_gain_sum = 0.0
@@ -273,18 +531,46 @@ class Trainer:
         blind_gain_sum = 0.0
         blind_ratio_sum = 0.0
         blind_count = 0
+        blind_abs_sum = 0.0
+        blind_sq_sum = 0.0
+        blind_pix_sum = 0.0
 
         with torch.no_grad():
             for idx, (lr_blur_seq, hr_sharp_seq, lr_sharp_seq, flow) in enumerate(dataloader):
-                lr_blur_seq, hr_sharp_seq, lr_sharp_seq, flow = lr_blur_seq.cuda(), hr_sharp_seq.cuda(), lr_sharp_seq.cuda(), flow.cuda()
-                result_dict = self.model(lr_blur_seq, hr_sharp_seq)
+                lr_blur_seq = lr_blur_seq.cuda(non_blocking=True)
+                hr_sharp_seq = hr_sharp_seq.cuda(non_blocking=True)
+                lr_sharp_seq = lr_sharp_seq.cuda(non_blocking=True)
+                flow = flow.cuda(non_blocking=True)
+                t = hr_sharp_seq.shape[2]
+                blind_mask = None
+                if self.config.stage == 2:
+                    center_lr_for_mask = lr_blur_seq[:, :, t // 2:t // 2 + 1, :, :]
+                    center_hr_for_mask = hr_sharp_seq[:, :, t // 2:t // 2 + 1, :, :]
+                    blind_mask, _ = self._build_blind_masks(center_lr_for_mask, center_hr_for_mask)
+
+                amp_ctx = torch.amp.autocast('cuda', dtype=self.amp_dtype) if self.use_amp else nullcontext()
+                with amp_ctx:
+                    result_dict = self.model(lr_blur_seq, hr_sharp_seq, blind_mask=blind_mask)
                 if self.config.stage == 1:
                     report.update_recon_metric(result_dict['recon'], lr_blur_seq[:, :, lr_blur_seq.shape[2] // 2, :, :])
                 else:
                     report.update_restoration_metric(result_dict['output'],
                                                      hr_sharp_seq[:, :, hr_sharp_seq.shape[2] // 2, :, :])
 
-                align_metrics = self._compute_align_metrics(result_dict, lr_blur_seq, hr_sharp_seq, flow)
+                    # Blind-region restoration metrics for checkpoint fallback and targeted trend monitoring.
+                    center_hr_2d = hr_sharp_seq[:, :, t // 2, :, :]
+                    center_out_2d = result_dict['output']
+                    blind_mask_2d = blind_mask[:, :, 0, :, :]
+                    blind_pixels = blind_mask_2d.sum().item()
+                    if blind_pixels > 0:
+                        diff = center_out_2d - center_hr_2d
+                        blind_abs_sum += (diff.abs() * blind_mask_2d).sum().item()
+                        blind_sq_sum += ((diff ** 2) * blind_mask_2d).sum().item()
+                        blind_pix_sum += blind_pixels
+
+                align_metrics = None
+                if compute_align_metrics:
+                    align_metrics = self._compute_align_metrics(result_dict, lr_blur_seq, hr_sharp_seq, flow)
                 if align_metrics is not None:
                     bsz = align_metrics['batch_size']
                     align_before_sum += align_metrics['before_l1'] * bsz
@@ -305,7 +591,7 @@ class Trainer:
                         blind_count += bsz
 
                     # 可选：每个验证 epoch 只保存首个 batch 的可视化，避免大量IO拖慢训练。
-                    if getattr(self.config, 'save_val_align_vis', False) and idx == 0:
+                    if compute_align_metrics and getattr(self.config, 'save_val_align_vis', False) and idx == 0:
                         self._save_align_vis(epoch, idx, align_metrics['ref_seq'], align_metrics['warped_seq'])
 
         log_msg = f"VAL Epoch [{epoch}]\t" + report.val_result_str(time.time() - start)
@@ -324,9 +610,28 @@ class Trainer:
                     f"\tBlindAlignGain(%): {blind_gain_sum / blind_count:.3f}"
                 )
             log_msg += align_msg
+        elif bool(getattr(self.config, 'enable_align_metrics', True)):
+            # Keep logs explicit when alignment metrics are intentionally skipped this epoch.
+            log_msg += f"\tAlignMetrics: skipped (period={align_period})"
+
+        blind_l1 = None
+        blind_psnr = None
+        if self.config.stage == 2 and blind_pix_sum > 0:
+            blind_l1 = blind_abs_sum / blind_pix_sum
+            blind_mse = blind_sq_sum / blind_pix_sum
+            blind_psnr = 10.0 * np.log10(1.0 / max(blind_mse, 1e-12))
+            log_msg += f"\tBlindL1: {blind_l1:.6f}\tBlindPSNR: {blind_psnr:.3f}"
 
         val_log.write(log_msg)
-        return report.psnr if self.config.stage == 2 else report.recon_psnr
+        if self.config.stage == 2:
+            # Return scalar PSNR to keep main.py checkpoint logic type-safe.
+            val_psnr_scalar = float(np.mean(report.psnr)) if len(report.psnr) > 0 else 0.0
+            return {
+                'val_psnr': val_psnr_scalar,
+                'blind_l1': blind_l1,
+                'blind_psnr': blind_psnr
+            }
+        return float(np.mean(report.recon_psnr)) if len(report.recon_psnr) > 0 else 0.0
 
     def test(self, dataloader):
         self.model.eval()
@@ -402,6 +707,25 @@ class Trainer:
         from utils import TestReport
         report = TestReport()
 
+        def load_blind_coords(csv_path):
+            # 读取仿真保存的盲元坐标，并去重，确保统计稳定。
+            if not os.path.exists(csv_path):
+                return None
+            coords = []
+            with open(csv_path, 'r', encoding='utf-8-sig', newline='') as f:
+                reader = csv.DictReader(f)
+                if reader.fieldnames is None or 'x' not in reader.fieldnames or 'y' not in reader.fieldnames:
+                    return None
+                for row in reader:
+                    try:
+                        coords.append((int(float(row['x'])), int(float(row['y']))))
+                    except Exception:
+                        continue
+            if len(coords) == 0:
+                return None
+            arr = np.unique(np.array(coords, dtype=np.int32), axis=0)
+            return arr
+
         def natural_sort_key(s):
             return [int(text) if text.isdigit() else text.lower() for text in re.split('([0-9]+)', s)]
 
@@ -410,6 +734,29 @@ class Trainer:
         for root, _, files in os.walk(gt_dir):
             for f in files:
                 if f.endswith('.png'): gt_map[f] = os.path.join(root, f)
+
+        # 盲元专项评估输入：仿真时保存的坐标文件 + 输入盲图（用于计算恢复增益）。
+        test_mask_csv = getattr(
+            self.config,
+            'test_mask_csv',
+            os.path.join(self.config.dataset_path, 'test_mask', '001', 'blind_pixel_coords.csv')
+        )
+        blind_coords = load_blind_coords(test_mask_csv)
+
+        input_root = os.path.join(self.config.dataset_path, 'test_blur')
+        input_map = {}
+        if os.path.exists(input_root):
+            for root, _, files in os.walk(input_root):
+                for f in files:
+                    if f.endswith('.png'):
+                        input_map[f] = os.path.join(root, f)
+
+        blind_abs_sum = 0.0
+        blind_sq_sum = 0.0
+        blind_abs_in_sum = 0.0
+        blind_sq_in_sum = 0.0
+        blind_pix_sum = 0
+        blind_row_logs = []
 
         print(f"===> 开始定量打分，准备比对 {len(out_imgs)} 张图片...")
         for img_name in out_imgs:
@@ -422,7 +769,95 @@ class Trainer:
                     if out_img.shape != gt_img.shape:
                         out_img = cv2.resize(out_img, (gt_img.shape[1], gt_img.shape[0]))
                     report.update_metric(gt_img, out_img, img_name)
+
+                    # 盲元专项评估：仅在 CSV 指定坐标统计误差，直接对应你的仿真盲元位置。
+                    if blind_coords is not None:
+                        h, w = gt_img.shape[:2]
+                        x = blind_coords[:, 0]
+                        y = blind_coords[:, 1]
+                        valid = (x >= 0) & (x < w) & (y >= 0) & (y < h)
+                        if np.any(valid):
+                            x = x[valid]
+                            y = y[valid]
+
+                            gt_vals = gt_img[y, x].astype(np.float64)
+                            out_vals = out_img[y, x].astype(np.float64)
+                            err = out_vals - gt_vals
+
+                            blind_abs = np.abs(err)
+                            blind_sq = err ** 2
+
+                            blind_abs_sum += float(blind_abs.sum())
+                            blind_sq_sum += float(blind_sq.sum())
+                            blind_pix_sum += int(len(err))
+
+                            # 同时记录输入盲图误差，便于看“修复提升了多少”。
+                            in_path = input_map.get(img_name)
+                            in_mae = None
+                            if in_path and os.path.exists(in_path):
+                                in_img = cv2.imread(in_path, cv2.IMREAD_GRAYSCALE)
+                                if in_img is not None:
+                                    if in_img.shape != gt_img.shape:
+                                        in_img = cv2.resize(in_img, (gt_img.shape[1], gt_img.shape[0]))
+                                    in_vals = in_img[y, x].astype(np.float64)
+                                    in_err = in_vals - gt_vals
+                                    in_abs = np.abs(in_err)
+                                    in_sq = in_err ** 2
+                                    blind_abs_in_sum += float(in_abs.sum())
+                                    blind_sq_in_sum += float(in_sq.sum())
+                                    in_mae = float(in_abs.mean())
+
+                            row = {
+                                'image': img_name,
+                                'blind_mae': float(blind_abs.mean()),
+                                'blind_rmse': float(np.sqrt(blind_sq.mean())),
+                                'blind_psnr': float(10.0 * np.log10((255.0 * 255.0) / max(float(blind_sq.mean()), 1e-12))),
+                                'blind_mae_input': in_mae,
+                                'blind_count': int(len(err))
+                            }
+                            if in_mae is not None:
+                                row['blind_mae_gain_abs'] = in_mae - row['blind_mae']
+                                row['blind_mae_gain_pct'] = 100.0 * row['blind_mae_gain_abs'] / (in_mae + 1e-12)
+                            blind_row_logs.append(row)
         report.print_final_result()
+
+        # 汇总输出盲元专项指标，便于不同模型横向比较。
+        if blind_coords is not None and blind_pix_sum > 0:
+            blind_mae = blind_abs_sum / blind_pix_sum
+            blind_mse = blind_sq_sum / blind_pix_sum
+            blind_rmse = float(np.sqrt(blind_mse))
+            blind_psnr = float(10.0 * np.log10((255.0 * 255.0) / max(blind_mse, 1e-12)))
+
+            print("===> Blind-Pixel Focused Metrics")
+            print(f"BlindCoordsCSV: {test_mask_csv}")
+            print(f"BlindCount(total sampled): {blind_pix_sum}")
+            print(f"Blind MAE: {blind_mae:.6f} | Blind RMSE: {blind_rmse:.6f} | Blind PSNR: {blind_psnr:.3f}")
+
+            if blind_abs_in_sum > 0:
+                blind_mae_in = blind_abs_in_sum / blind_pix_sum
+                blind_mse_in = blind_sq_in_sum / blind_pix_sum
+                blind_psnr_in = float(10.0 * np.log10((255.0 * 255.0) / max(blind_mse_in, 1e-12)))
+                gain_abs = blind_mae_in - blind_mae
+                gain_pct = 100.0 * gain_abs / (blind_mae_in + 1e-12)
+                print(
+                    f"Input Blind MAE: {blind_mae_in:.6f} | Input Blind PSNR: {blind_psnr_in:.3f} | "
+                    f"MAE Gain: {gain_abs:.6f} ({gain_pct:.2f}%)"
+                )
+
+            save_blind_dir = os.path.join(self.config.save_dir, 'blind_eval')
+            os.makedirs(save_blind_dir, exist_ok=True)
+            save_blind_csv = os.path.join(save_blind_dir, 'test_blind_metrics.csv')
+            if len(blind_row_logs) > 0:
+                keys = [
+                    'image', 'blind_mae', 'blind_rmse', 'blind_psnr',
+                    'blind_mae_input', 'blind_mae_gain_abs', 'blind_mae_gain_pct', 'blind_count'
+                ]
+                with open(save_blind_csv, 'w', encoding='utf-8', newline='') as f:
+                    writer = csv.DictWriter(f, fieldnames=keys)
+                    writer.writeheader()
+                    for row in blind_row_logs:
+                        writer.writerow(row)
+                print(f"Blind per-image metrics saved to: {save_blind_csv}")
 
     def save_checkpoint(self, epoch):
         save_dict = {'epoch': epoch, 'model_D_state_dict': self.model.degradation_learning_network.state_dict(),

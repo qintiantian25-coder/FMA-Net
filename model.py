@@ -549,6 +549,14 @@ class Net_R(torch.nn.Module):
         self.relu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
         self.upsample = PixelShuffleBlock(dim, bias=bias, scale=config.scale)
 
+        # Blind residual branch: only aims to refine masked blind regions in stage-2.
+        self.blind_res_conv1 = nn.Conv2d(dim, dim, kernel_size=3, padding=1, stride=1, bias=bias)
+        self.blind_res_conv2 = nn.Conv2d(dim, in_channels, kernel_size=3, padding=1, stride=1, bias=bias)
+        self.blind_gate_conv = nn.Conv2d(dim, 1, kernel_size=3, padding=1, stride=1, bias=bias)
+        self.blind_gate_act = nn.Sigmoid()
+        self.blind_res_scale = float(getattr(config, 'blind_res_scale', 1.0))
+        self.blind_infer_threshold = float(getattr(config, 'blind_infer_threshold', 0.08))
+
         # generate restoration kernels
         self.r_conv = nn.Sequential(nn.Conv3d(dim//num_seq, dim, kernel_size=[1, 3, 3], padding=[0, 1, 1], stride=1, bias=bias),
                                     nn.LeakyReLU(negative_slope=0.2, inplace=True),
@@ -573,7 +581,7 @@ class Net_R(torch.nn.Module):
                                     nn.LeakyReLU(negative_slope=0.2, inplace=True),
                                     nn.Conv3d(dim, in_channels, kernel_size=[1, 3, 3], padding=[0, 1, 1], stride=1, bias=bias))
 
-    def forward(self, x, F, f, KD):
+    def forward(self, x, F, f, KD, blind_mask=None):
         # x: [B, 3, T, H, W]
         # F: [B, C, T, H, W]
         # f: [B, 3*num_flow, T, H, W]
@@ -606,10 +614,29 @@ class Net_R(torch.nn.Module):
 
         f_X_final = self.f_conv3(feat_to_cat)
         _, warped_X = self.bwarp(x, f_X_final)  # 最终对齐
-        output = self.duf(warped_X, KR) + res
+        base_output = self.duf(warped_X, KR) + res
+
+        # Blind-branch predicts a local residual and confidence gate from restoration features.
+        blind_feat = self.relu(self.blind_res_conv1(Fw))
+        blind_res = self.blind_res_conv2(blind_feat) * self.blind_res_scale
+        blind_gate = self.blind_gate_act(self.blind_gate_conv(blind_feat))
+
+        # During training/validation, blind_mask is provided by trainer; during test, use input heuristic.
+        if blind_mask is None:
+            center_lr = x[:, :, T // 2, :, :]
+            blind_mask = (center_lr <= self.blind_infer_threshold).float()
+        elif blind_mask.dim() == 5:
+            blind_mask = blind_mask[:, :, 0, :, :]
+
+        if blind_mask.shape[-2:] != base_output.shape[-2:]:
+            blind_mask = torch.nn.functional.interpolate(blind_mask, size=base_output.shape[-2:], mode='nearest')
+
+        blind_mask = blind_mask.to(base_output.dtype).clamp(0.0, 1.0)
+        blind_mask = blind_mask * blind_gate
+        output = base_output + blind_mask * blind_res
         anchor = self.a_conv(F)
 
-        return output, warped_X, anchor
+        return output, warped_X, anchor, blind_res, blind_gate, blind_mask, base_output
 
 
 class FMANet(torch.nn.Module):
@@ -624,7 +651,7 @@ class FMANet(torch.nn.Module):
         if self.stage == 2:
             self.restoration_network = Net_R(config)
 
-    def forward(self, x, y=None):
+    def forward(self, x, y=None, blind_mask=None):
         # x: [B, 3, T, H, W]
         # y: [B, 3, T, sH, sW]
 
@@ -646,9 +673,15 @@ class FMANet(torch.nn.Module):
             return result_dict
 
         elif self.stage == 2:
-            output, warped_X, anchor_R = self.restoration_network(x, F, f, KD)
+            output, warped_X, anchor_R, blind_res, blind_gate, blind_mask_used, base_output = self.restoration_network(
+                x, F, f, KD, blind_mask=blind_mask
+            )
             result_dict['output'] = output
             result_dict['lr_warp'] = warped_X
             result_dict['F_sharp_R'] = anchor_R
+            result_dict['blind_res'] = blind_res
+            result_dict['blind_gate'] = blind_gate
+            result_dict['blind_mask'] = blind_mask_used
+            result_dict['base_output'] = base_output
 
             return result_dict

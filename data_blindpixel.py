@@ -155,13 +155,26 @@ def get_dataset(config, type='train'):
     )
 
     is_train = (type == 'train')
-    dataloader = DataLoader(
-        dataset,
+    num_workers = int(config.nThreads)
+    pin_memory = bool(getattr(config, 'pin_memory', True))
+    persistent_workers = bool(getattr(config, 'persistent_workers', True)) and (num_workers > 0)
+    prefetch_factor = int(getattr(config, 'prefetch_factor', 2))
+
+    loader_kwargs = dict(
+        dataset=dataset,
         batch_size=config.batch_size if is_train else 1,
         shuffle=is_train,  # 训练时打乱，测试时不打乱
-        num_workers=int(config.nThreads),
-        pin_memory=True,
-        drop_last=is_train
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=is_train,
+        persistent_workers=persistent_workers,
+    )
+    # prefetch_factor 仅在多进程 DataLoader 生效。
+    if num_workers > 0:
+        loader_kwargs['prefetch_factor'] = prefetch_factor
+
+    dataloader = DataLoader(
+        **loader_kwargs
     )
 
     return dataloader

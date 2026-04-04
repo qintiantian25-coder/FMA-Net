@@ -209,8 +209,8 @@ def run_consistent_simulation(src_dir, dst_dir, mask_dir):
 if __name__ == "__main__":
     DATA_BASE = r"D:\project\FMA-Net\data"
     run_consistent_simulation(
-        os.path.join(DATA_BASE, "train_sharp", "001"),
-        os.path.join(DATA_BASE, "train_blur", "001"),
-        os.path.join(DATA_BASE, "train_mask", "001")
+        os.path.join(DATA_BASE, "test_sharp", "001"),
+        os.path.join(DATA_BASE, "test_blur", "001"),
+        os.path.join(DATA_BASE, "test_mask", "001")
     )
     print("仿真完成：暗主导块已改为稠密、深度黑色簇（0-15灰度），视觉上极清晰。")

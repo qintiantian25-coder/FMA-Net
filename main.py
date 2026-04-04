@@ -1,15 +1,9 @@
 import os
 import torch
-# 1. 强制同步，报错位置会变得精确
-os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
-# 2. 禁用 cuDNN 优化，避免黑盒算子错误
-torch.backends.cudnn.enabled = True
-torch.backends.cudnn.benchmark = False
-# 3. 针对 Blackwell 的特殊设置
-torch.backends.cuda.matmul.allow_tf32 = True
 import random
 import argparse
 import numpy as np
+import numbers
 
 from model import FMANet
 from train import Trainer
@@ -40,7 +34,8 @@ def train(config):
     if config.stage == 2:
         trainer.load_best_stage1_model()
 
-    best_psnr = 0
+    best_psnr = float('-inf')
+    best_blind_l1 = float('inf')
     last_epoch = 0
     if config.finetuning:
         last_epoch = trainer.load_checkpoint()
@@ -52,21 +47,56 @@ def train(config):
         if (epoch + 1) % config.val_period == 0 or epoch == config.num_epochs - 1:
             val_result = trainer.validate(val_dataloader, val_log, epoch)
 
-            # --- 修改建议：根据 Stage 稳健提取指标 ---
-            if isinstance(val_result, (list, tuple)):
-                current_psnr = val_result[0]  # 通常第一个是主要的 PSNR 指标
+            # validate 支持返回字典: 主指标(PSNR) + 盲元兜底指标(BlindL1/BlindPSNR)。
+            if isinstance(val_result, dict):
+                current_psnr = float(val_result.get('val_psnr', float('-inf')))
+                current_blind_l1 = val_result.get('blind_l1', None)
+            elif isinstance(val_result, (list, tuple)):
+                current_psnr = val_result[0]
+                current_blind_l1 = None
             else:
                 current_psnr = val_result
+                current_blind_l1 = None
+
+            # Robust scalar conversion: accepts Python/NumPy numbers, tensors, lists, and arrays.
+            # This prevents np.isinf/np.isnan from crashing when validate() returns non-scalar containers.
+            if isinstance(current_psnr, numbers.Number):
+                current_psnr = float(current_psnr)
+            elif torch.is_tensor(current_psnr):
+                current_psnr = float(current_psnr.detach().float().mean().item())
+            else:
+                try:
+                    current_psnr = float(np.asarray(current_psnr, dtype=np.float64).mean())
+                except Exception:
+                    print(f"[!] Warning: Unsupported PSNR type at Epoch {epoch + 1}: {type(current_psnr)}")
+                    continue
 
             # 如果 PSNR 是 0 或 Inf，可能是数据问题，打印提醒
             if np.isinf(current_psnr) or np.isnan(current_psnr):
                 print(f"[!] Warning: Invalid PSNR detected at Epoch {epoch + 1}")
                 continue
 
-            if current_psnr > best_psnr:
+            psnr_eps = getattr(config, 'checkpoint_psnr_tolerance', 1e-4)
+            blind_eps = getattr(config, 'checkpoint_blind_l1_tolerance', 1e-6)
+
+            # 主指标优先；主指标接近持平时，用 BlindL1 更低者作为兜底优胜。
+            better_by_psnr = current_psnr > (best_psnr + psnr_eps)
+            tie_on_psnr = abs(current_psnr - best_psnr) <= psnr_eps
+            better_by_blind = (
+                tie_on_psnr and
+                current_blind_l1 is not None and
+                (current_blind_l1 + blind_eps) < best_blind_l1
+            )
+
+            if better_by_psnr or better_by_blind:
                 best_psnr = current_psnr
+                if current_blind_l1 is not None:
+                    best_blind_l1 = current_blind_l1
                 trainer.save_best_model(epoch)
-                print(f"[*] New Best PSNR: {best_psnr:.3f} saved at Epoch {epoch + 1}")
+                if current_blind_l1 is not None:
+                    print(f"[*] New Best saved at Epoch {epoch + 1} | PSNR: {best_psnr:.3f}, BlindL1: {best_blind_l1:.6f}")
+                else:
+                    print(f"[*] New Best PSNR: {best_psnr:.3f} saved at Epoch {epoch + 1}")
 
 
 def test(config):
@@ -121,6 +151,16 @@ if __name__ == '__main__':
 
     # 载入配置
     config = Config(args.config_path)
+
+    # Runtime backend tuning: default to fast path, keep debug sync optional.
+    if getattr(config, 'cuda_launch_blocking', False):
+        os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+    else:
+        os.environ.pop('CUDA_LAUNCH_BLOCKING', None)
+
+    torch.backends.cudnn.enabled = True
+    torch.backends.cudnn.benchmark = bool(getattr(config, 'cudnn_benchmark', True))
+    torch.backends.cuda.matmul.allow_tf32 = True
 
     # 设置随机种子
     torch.manual_seed(config.seed)
