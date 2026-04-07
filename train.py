@@ -756,7 +756,7 @@ class Trainer:
         blind_abs_in_sum = 0.0
         blind_sq_in_sum = 0.0
         blind_pix_sum = 0
-        blind_row_logs = []
+        per_image_logs = []
 
         print(f"===> 开始定量打分，准备比对 {len(out_imgs)} 张图片...")
         for img_name in out_imgs:
@@ -769,6 +769,22 @@ class Trainer:
                     if out_img.shape != gt_img.shape:
                         out_img = cv2.resize(out_img, (gt_img.shape[1], gt_img.shape[0]))
                     report.update_metric(gt_img, out_img, img_name)
+                    full_psnr = float(report.total_rgb_psnr[-1])
+                    full_ssim = float(report.total_ssim[-1])
+
+                    # Always log full-frame quality so every test run has complete per-image records.
+                    row = {
+                        'image': img_name,
+                        'psnr': full_psnr,
+                        'ssim': full_ssim,
+                        'blind_mae': None,
+                        'blind_rmse': None,
+                        'blind_psnr': None,
+                        'blind_mae_input': None,
+                        'blind_mae_gain_abs': None,
+                        'blind_mae_gain_pct': None,
+                        'blind_count': 0
+                    }
 
                     # 盲元专项评估：仅在 CSV 指定坐标统计误差，直接对应你的仿真盲元位置。
                     if blind_coords is not None:
@@ -807,19 +823,35 @@ class Trainer:
                                     blind_sq_in_sum += float(in_sq.sum())
                                     in_mae = float(in_abs.mean())
 
-                            row = {
-                                'image': img_name,
+                            row.update({
                                 'blind_mae': float(blind_abs.mean()),
                                 'blind_rmse': float(np.sqrt(blind_sq.mean())),
                                 'blind_psnr': float(10.0 * np.log10((255.0 * 255.0) / max(float(blind_sq.mean()), 1e-12))),
                                 'blind_mae_input': in_mae,
                                 'blind_count': int(len(err))
-                            }
+                            })
                             if in_mae is not None:
                                 row['blind_mae_gain_abs'] = in_mae - row['blind_mae']
                                 row['blind_mae_gain_pct'] = 100.0 * row['blind_mae_gain_abs'] / (in_mae + 1e-12)
-                            blind_row_logs.append(row)
+                    per_image_logs.append(row)
         report.print_final_result()
+
+        # Save full-frame + blind-region per-image metrics for every test run.
+        save_blind_dir = os.path.join(self.config.save_dir, 'blind_eval')
+        os.makedirs(save_blind_dir, exist_ok=True)
+        save_blind_csv = os.path.join(save_blind_dir, 'test_blind_metrics.csv')
+        if len(per_image_logs) > 0:
+            keys = [
+                'image', 'psnr', 'ssim',
+                'blind_mae', 'blind_rmse', 'blind_psnr',
+                'blind_mae_input', 'blind_mae_gain_abs', 'blind_mae_gain_pct', 'blind_count'
+            ]
+            with open(save_blind_csv, 'w', encoding='utf-8', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=keys)
+                writer.writeheader()
+                for row in per_image_logs:
+                    writer.writerow(row)
+            print(f"Per-image test metrics saved to: {save_blind_csv}")
 
         # 汇总输出盲元专项指标，便于不同模型横向比较。
         if blind_coords is not None and blind_pix_sum > 0:
@@ -844,19 +876,7 @@ class Trainer:
                     f"MAE Gain: {gain_abs:.6f} ({gain_pct:.2f}%)"
                 )
 
-            save_blind_dir = os.path.join(self.config.save_dir, 'blind_eval')
-            os.makedirs(save_blind_dir, exist_ok=True)
-            save_blind_csv = os.path.join(save_blind_dir, 'test_blind_metrics.csv')
-            if len(blind_row_logs) > 0:
-                keys = [
-                    'image', 'blind_mae', 'blind_rmse', 'blind_psnr',
-                    'blind_mae_input', 'blind_mae_gain_abs', 'blind_mae_gain_pct', 'blind_count'
-                ]
-                with open(save_blind_csv, 'w', encoding='utf-8', newline='') as f:
-                    writer = csv.DictWriter(f, fieldnames=keys)
-                    writer.writeheader()
-                    for row in blind_row_logs:
-                        writer.writerow(row)
+            if len(per_image_logs) > 0:
                 print(f"Blind per-image metrics saved to: {save_blind_csv}")
 
     def save_checkpoint(self, epoch):
@@ -890,7 +910,11 @@ class Trainer:
         print("[*] Loaded Best Model.")
 
     def load_best_stage1_model(self):
-        stage1_path = self.checkpoint_path.replace('stage2', 'stage1')
+        # Prefer explicit stage1_pretrained_dir so Stage2 can save to a new folder safely.
+        if getattr(self.config, 'stage1_pretrained_dir', ''):
+            stage1_path = os.path.join(self.config.stage1_pretrained_dir, 'model_stage1')
+        else:
+            stage1_path = self.checkpoint_path.replace('stage2', 'stage1')
         best_path = os.path.join(stage1_path, 'model_best.pt')
         ckpt = torch.load(best_path)
         self.model.degradation_learning_network.load_state_dict(ckpt['model_D_state_dict'])

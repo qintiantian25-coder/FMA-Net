@@ -37,7 +37,9 @@ def RGB_PSNR(img1, img2, border=0):
             img2 = img2[..., border:-border, border:-border]
         img1 = img1.float()
         img2 = img2.float()
-        mse = torch.mean(((img1 * 255.0) - (img2 * 255.0)) ** 2)
+        # Be robust to both [0,1] tensors (training/validation) and [0,255] tensors (test utilities).
+        scale = 1.0 if (img1.detach().max() > 1.5 or img2.detach().max() > 1.5) else 255.0
+        mse = torch.mean(((img1 * scale) - (img2 * scale)) ** 2)
         if mse.item() == 0:
             return float('inf')
         return float(20.0 * torch.log10(torch.tensor(255.0, device=img1.device) / torch.sqrt(mse)).item())
@@ -187,12 +189,9 @@ class TestReport:
         # 如果需要保存到文件，可以在此处仿照 Train_Report 开启文件流
 
     def update_metric(self, gt, output, filename):
-        # 统一转为 Tensor 计算，利用已有的 RGB_PSNR/SSIM
-        gt_t = torch.from_numpy(gt).float()
-        out_t = torch.from_numpy(output).float()
-
-        psnr = RGB_PSNR(out_t, gt_t)
-        ssim_val = SSIM(out_t, gt_t)
+        # Keep uint8 numpy path to avoid accidental value-range mismatch in PSNR.
+        psnr = RGB_PSNR(output, gt)
+        ssim_val = SSIM(output, gt)
 
         self.total_rgb_psnr.append(psnr)
         self.total_ssim.append(ssim_val)

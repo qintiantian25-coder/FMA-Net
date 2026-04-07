@@ -19,6 +19,9 @@ class Config:
         # training
         self.dataset_path = parser.get('training', 'dataset_path')
         self.save_dir = parser.get('training', 'save_dir')
+        # Optional: keep Stage1 loading path independent from current save_dir.
+        # Useful when starting a new Stage2 run in a separate folder.
+        self.stage1_pretrained_dir = parser.get('training', 'stage1_pretrained_dir', fallback='')
         self.stage = int(parser.get('training', 'stage'))
         self.log_dir = parser.get('training', 'log_dir')
         self.log_dir = os.path.join(self.save_dir, f'stage{self.stage}_{self.log_dir}')
