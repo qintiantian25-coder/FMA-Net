@@ -99,6 +99,12 @@ class Config:
         self.ffn_expansion_factor = float(parser.get('network', 'ffn_expansion_factor'))
         self.bias = (parser.get('network', 'bias') == 'True')
 
+        # --- 新增融合逻辑权重 (对应 experiment.cfg 中的 [network] 部分) ---
+        # base_alpha: 邻帧补偿(DUF)的基础权重。设为0.8，表示大幅度信任相邻清晰帧。
+        self.base_alpha = float(parser.get('network', 'base_alpha', fallback='0.8'))
+        # base_beta: 自身重构(Res)的基础权重。设为0.2，提供基础结构信息。
+        self.base_beta = float(parser.get('network', 'base_beta', fallback='0.2'))
+
         # validation
         self.val_period = int(parser.get('validation', 'val_period'))
         self.save_val_align_vis = parser.getboolean('validation', 'save_val_align_vis', fallback=False)

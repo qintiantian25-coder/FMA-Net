@@ -211,21 +211,34 @@ class SaveManager:
     def __init__(self, config):
         self.config = config
 
-    def save_batch_images(self, src, batch_size, step):
-        num = min(batch_size, 4)
-        dir = self.config.log_dir
-        os.makedirs(dir, exist_ok=True)
+    def save_batch_images(self, src, batch_size, iter_step, prefix='step'):
+        # 增加 prefix 参数以适配 validate 里的调用
+        num = min(batch_size, 2)  # 验证或训练时保存前2张即可
+        save_dir = self.config.log_dir
+        os.makedirs(save_dir, exist_ok=True)
 
-        # 将多个阶段图拼接保存 [Batch, C, H, W]
         for i in range(num):
             combined = []
             for img_tensor in src:
+                # 1. 去归一化
                 img = denorm(img_tensor[i])  # [C, H, W]
-                if img.shape[0] == 1:  # 灰度图
+
+                # 2. 处理灰度图维度
+                if img.shape[0] == 1:
                     img = img.squeeze(0)  # [H, W]
-                else:  # 彩色图
-                    img = np.transpose(img, (1, 2, 0))  # [H, W, C]
+                    # 关键适配：即便只有灰度通道，也转成 BGR(灰色)
+                    # 这样能确保所有图像维度一致（H, W, 3），拼接绝不报错
+                    img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+                else:
+                    # 如果是彩色图，转为 BGR 适配 OpenCV
+                    img = np.transpose(img, (1, 2, 0))
+                    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
                 combined.append(img)
 
+            # 3. 横向拼接并保存
             final_img = np.concatenate(combined, axis=1)
-            cv2.imwrite(os.path.join(dir, f"step_{step:06d}_batch_{i}.png"), final_img)
+
+            # 根据传入的 prefix 区分文件名（例如 val_001.png 或 step_000100.png）
+            filename = f"{prefix}_{iter_step:06d}_batch_{i}.png"
+            cv2.imwrite(os.path.join(save_dir, filename), final_img)
