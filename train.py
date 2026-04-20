@@ -374,34 +374,39 @@ class Trainer:
 
                 elif self.config.stage == 2:
                     center_hr_2d = hr_sharp_seq[:, :, t // 2, :, :]
-                    restoration_loss = self.criterion(result_dict['output'].float(), center_hr_2d.float())
+                    center_out = result_dict['output']
 
-                    # --- 核心新增：盲元分支专项残差損失 ---
+                    # 2D 盲元掩码与计数（用于按盲元像素平均）
+                    blind_mask_2d = blind_mask[:, :, 0, :, :].float()
+                    blind_pixels = blind_mask_2d.sum().clamp_min(1.0)
+                    non_blind_mask_2d = 1.0 - blind_mask_2d
+                    non_blind_pixels = non_blind_mask_2d.sum().clamp_min(1.0)
+
+                    # restoration_loss: 仅在非盲元区域计算（按像素平均），避免与盲元分支冲突
+                    restoration_loss = (torch.abs(center_out - center_hr_2d) * non_blind_mask_2d).sum() / non_blind_pixels
+
+                    # blind_res_loss: 对 blind_res 分支只在盲区做平均残差监督（按盲元像素平均）
                     with torch.no_grad():
                         target_res = center_hr_2d - result_dict['base_output']
+                    masked_res_abs = torch.abs(result_dict['blind_res'] - target_res) * blind_mask_2d
+                    blind_res_loss = masked_res_abs.sum() / blind_pixels
 
-                    # 只在 blind_mask 区域计算残差损失，强迫该分支补全遮挡细节
-                    blind_res_loss = torch.mean(
-                        torch.abs(result_dict['blind_res'] - target_res) * blind_mask[:, :, 0, :, :])
-                    # ---------------------------
-
+                    # recon_loss 保持不变（Net_D 的重建监督）
                     recon_loss = self.config.Net_D_weight * self.smart_recon_loss(
                         result_dict['recon'], lr_blur_seq[:, :, t // 2, :, :]
                     )
 
-                    blind_mask_2d = blind_mask[:, :, 0, :, :]
-                    blind_pixels = blind_mask_2d.sum().clamp_min(1.0)
-                    blind_l1 = (torch.abs(result_dict[
-                                              'output'].float() - center_hr_2d.float()) * blind_mask_2d.float()).sum() / blind_pixels
+                    # blind_restore_loss: final output 在盲区的平均 L1（保持做为评估与损失项）
+                    blind_l1 = (torch.abs(center_out - center_hr_2d) * blind_mask_2d).sum() / blind_pixels
                     blind_restore_loss = self.config.blind_restore_loss_weight * blind_l1
 
+                    # lr_warping_loss: 仍使用非盲区作为监督（和原逻辑一致）
                     center_lr = lr_blur_seq[:, :, t // 2:t // 2 + 1, :, :]
                     non_blind_mask = 1.0 - blind_mask
                     target_lr = center_lr.expand(-1, -1, t, -1, -1)
                     non_blind_mask_t = non_blind_mask.expand(-1, -1, t, -1, -1)
                     valid_non_blind = non_blind_mask_t.sum().clamp_min(1.0)
-                    masked_l1 = (torch.abs(result_dict[
-                                               'lr_warp'].float() - target_lr.float()) * non_blind_mask_t.float()).sum() / valid_non_blind
+                    masked_l1 = (torch.abs(result_dict['lr_warp'].float() - target_lr.float()) * non_blind_mask_t.float()).sum() / valid_non_blind
                     lr_warping_loss = self.config.lr_warping_loss_weight * masked_l1
 
                     hr_target = hr_sharp_seq[:, :, t // 2:t // 2 + 1, :, :].expand(-1, -1, t, -1, -1)
@@ -414,16 +419,22 @@ class Trainer:
                         result_dict['image_flow'].float(), flow.view(b, 2, t, h, w).float()
                     )
 
-                    R_TA_loss = self.config.R_TA_loss_weight * self.criterion(result_dict['F_sharp_R'].float(),
-                                                                              lr_sharp_seq.float())
+                    R_TA_loss = self.config.R_TA_loss_weight * self.criterion(result_dict['F_sharp_R'].float(), lr_sharp_seq.float())
                     D_TA_loss = self.config.Net_D_weight * self.config.D_TA_loss_weight * self.criterion(
                         result_dict['F_sharp_D'].float(), lr_sharp_seq.float()
                     )
 
-                    # 将 blind_res_loss 加入总损失
-                    total_loss = restoration_loss + blind_restore_loss + (blind_res_loss * 2.0) + \
-                                 recon_loss + hr_warping_loss + lr_warping_loss + \
-                                 flow_loss + R_TA_loss + D_TA_loss
+                    # 使用配置项 blind_res_loss_weight（fallback 到 2.0）替代代码中硬编码的 2.0
+                    blind_res_loss_weight = float(getattr(self.config, 'blind_res_loss_weight', 2.0))
+
+                    # 汇总总损失（restoration 在非盲区，盲区由 blind_res + blind_restore_loss 专门驱动）
+                    total_loss = (
+                        restoration_loss
+                        + blind_restore_loss
+                        + (blind_res_loss * blind_res_loss_weight)
+                        + recon_loss + hr_warping_loss + lr_warping_loss
+                        + flow_loss + R_TA_loss + D_TA_loss
+                    )
 
                     self.optimizer_D.zero_grad(set_to_none=True)
                     self.optimizer_R.zero_grad(set_to_none=True)

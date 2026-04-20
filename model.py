@@ -440,9 +440,15 @@ class Net_R(torch.nn.Module):
         num_seq = config.num_seq
         scale = config.scale
 
-        # --- 配置權重 (0.8:0.2 分配) ---
-        self.base_alpha = float(getattr(config, 'base_alpha', 0.8))
-        self.base_beta = float(getattr(config, 'base_beta', 0.2))
+        # --- 配置權重 (可學習) ---
+        # 将 base_alpha/base_beta/blind_res_scale 注册为可训练参数。
+        # 使用可逆映射保证数值约束：
+        #  - alpha, beta -> sigmoid(param) 映射到 (0,1)
+        #  - blind_res_scale -> softplus(param) 保证为正
+        self.base_alpha_param = nn.Parameter(torch.tensor(float(getattr(config, 'base_alpha', 0.8)), dtype=torch.float32))
+        self.base_beta_param = nn.Parameter(torch.tensor(float(getattr(config, 'base_beta', 0.2)), dtype=torch.float32))
+        # store initial scale param; use softplus on this param in forward to ensure > 0
+        self.blind_res_scale_param = nn.Parameter(torch.tensor(float(getattr(config, 'blind_res_scale', 1.20)), dtype=torch.float32))
 
         ds_kernel_size = config.ds_kernel_size
         us_kernel_size = config.us_kernel_size
@@ -483,7 +489,7 @@ class Net_R(torch.nn.Module):
         self.blind_gate_conv = nn.Conv2d(dim, 1, kernel_size=3, padding=1, stride=1, bias=bias)
         self.blind_gate_act = nn.Sigmoid()
 
-        self.blind_res_scale = float(getattr(config, 'blind_res_scale', 1.20))
+        # blind_res_scale is now represented by a learnable parameter `blind_res_scale_param` -> remove redundant cfg copy
         self.blind_infer_threshold = float(getattr(config, 'blind_infer_threshold', 0.10))
 
         self.r_conv = nn.Sequential(
@@ -533,8 +539,17 @@ class Net_R(torch.nn.Module):
 
         # 3. 盲元預測與掩碼
         blind_feat = self.relu(self.blind_res_conv1(Fw))
-        blind_res = self.blind_res_conv2(blind_feat) * self.blind_res_scale
+        # compute raw blind residual (scale applied below using a learnable positive param)
+        raw_blind_res = self.blind_res_conv2(blind_feat)
         blind_gate = self.blind_gate_act(self.blind_gate_conv(blind_feat))
+
+        # Map learnable params to constrained ranges and place on same device as features
+        base_alpha = torch.sigmoid(self.base_alpha_param).to(Fw.device)
+        base_beta = torch.sigmoid(self.base_beta_param).to(Fw.device)
+        blind_res_scale = F.softplus(self.blind_res_scale_param).to(Fw.device)
+
+        # scaled blind residual
+        blind_res = raw_blind_res * blind_res_scale
 
         if blind_mask is None:
             center_lr = x[:, :, T // 2, :, :]
@@ -551,8 +566,11 @@ class Net_R(torch.nn.Module):
         # ================================================================
         # 核心改進：局部比例融合邏輯
         # ================================================================
-        # 1. 計算盲元區專用的混合內容: 0.8 * 鄰幀補償 + 0.2 * (自身重構 + 盲元殘差)
-        blind_area_fill = (self.base_alpha * duf_output) + (self.base_beta * (res + blind_res))
+        # 1. 計算盲元區專用的混合內容:
+        #    α * 邻帧补偿(duf) + β * 自身重构(res) + blind_res_scale * blind_res
+        # Note: base_alpha/base_beta are from sigmoid-mapped learnable params,
+        # and blind_res contribution is controlled by blind_res_scale (softplus-mapped param).
+        blind_area_fill = (base_alpha * duf_output) + (base_beta * res) + blind_res
 
         # 2. 局部替換邏輯：
         # 非盲元區 (Mask=0): 直接使用 res (保證背景細節不動)

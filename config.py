@@ -53,10 +53,10 @@ class Config:
         self.blind_mask_threshold = float(parser.get("training", "blind_mask_threshold", fallback="0.08"))
         # Stage-2 盲元专项分支损失权重：仅对盲元掩码区域生效。
         self.blind_restore_loss_weight = float(parser.get("training", "blind_restore_loss_weight", fallback="0.2"))
-        # 盲元专项残差分支的输出缩放，便于平衡全图稳定性与盲元修补力度。
-        self.blind_res_scale = float(parser.get("training", "blind_res_scale", fallback="1.0"))
-        # 推理时无GT，使用中心帧阈值近似盲元区域。
-        self.blind_infer_threshold = float(parser.get("training", "blind_infer_threshold", fallback="0.08"))
+        # 盲元专项残差分支的输出缩放及盲元推理阈值：集中在 [fusion] 节管理
+        self.blind_res_scale = float(parser.get("fusion", "blind_res_scale", fallback="1.0"))
+        # 推理时无GT，使用中心帧阈值近似盲元区域（从 [fusion] 读取）。
+        self.blind_infer_threshold = float(parser.get("fusion", "blind_infer_threshold", fallback="0.08"))
         # 模型保存判定中的主指标容差与盲元兜底容差。
         self.checkpoint_psnr_tolerance = float(parser.get("training", "checkpoint_psnr_tolerance", fallback="1e-4"))
         self.checkpoint_blind_l1_tolerance = float(parser.get("training", "checkpoint_blind_l1_tolerance", fallback="1e-6"))
@@ -99,11 +99,12 @@ class Config:
         self.ffn_expansion_factor = float(parser.get('network', 'ffn_expansion_factor'))
         self.bias = (parser.get('network', 'bias') == 'True')
 
-        # --- 新增融合逻辑权重 (对应 experiment.cfg 中的 [network] 部分) ---
-        # base_alpha: 邻帧补偿(DUF)的基础权重。设为0.8，表示大幅度信任相邻清晰帧。
-        self.base_alpha = float(parser.get('network', 'base_alpha', fallback='0.8'))
-        # base_beta: 自身重构(Res)的基础权重。设为0.2，提供基础结构信息。
-        self.base_beta = float(parser.get('network', 'base_beta', fallback='0.2'))
+        # --- 融合逻辑权重 (集中从 [fusion] 节读取) ---
+        # base_alpha: 邻帧补偿(DUF)的基础权重。
+        self.base_alpha = float(parser.get('fusion', 'base_alpha', fallback='0.8'))
+        # base_beta: 自身重构(Res)的基础权重。
+        self.base_beta = float(parser.get('fusion', 'base_beta', fallback='0.2'))
+        # 可学习参数的初始 blind_res_scale（fusion 节）已在上方读取
 
         # validation
         self.val_period = int(parser.get('validation', 'val_period'))
