@@ -449,6 +449,14 @@ class Net_R(torch.nn.Module):
         self.base_beta_param = nn.Parameter(torch.tensor(float(getattr(config, 'base_beta', 0.2)), dtype=torch.float32))
         # store initial scale param; use softplus on this param in forward to ensure > 0
         self.blind_res_scale_param = nn.Parameter(torch.tensor(float(getattr(config, 'blind_res_scale', 1.20)), dtype=torch.float32))
+        # --- 盲元损失权重（可学习） ---
+        # restoration_loss_weight: non-blind region (final output outside blind) 的权重初值
+        # blind_restore_loss_weight: final output 在盲元区域的权重初值
+        # blind_res_loss_weight: blind residual 分支的权重初值
+        # restoration_loss_weight: non-blind region loss weight is controlled by config (fixed),
+        # not a learnable parameter to avoid the optimizer disabling non-blind protection.
+        self.blind_restore_loss_weight_param = nn.Parameter(torch.tensor(float(getattr(config, 'blind_restore_loss_weight', 0.6)), dtype=torch.float32))
+        self.blind_res_loss_weight_param = nn.Parameter(torch.tensor(float(getattr(config, 'blind_res_loss_weight', 2.0)), dtype=torch.float32))
 
         ds_kernel_size = config.ds_kernel_size
         us_kernel_size = config.us_kernel_size

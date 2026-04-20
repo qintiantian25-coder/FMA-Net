@@ -390,6 +390,8 @@ class Trainer:
 
                     # restoration_loss: 仅在非盲元区域计算（按像素平均），避免与盲元分支冲突
                     restoration_loss = (torch.abs(center_out - center_hr_2d) * non_blind_mask_2d).sum() / non_blind_pixels
+                    # restoration_loss_weight 由配置文件固定控制（避免可学习导致非盲区保护被削弱）
+                    restoration_weight = float(getattr(self.config, 'restoration_loss_weight', 1.0))
 
                     # blind_res_loss: 对 blind_res 分支只在盲区做平均残差监督（按盲元像素平均）
                     with torch.no_grad():
@@ -404,7 +406,13 @@ class Trainer:
 
                     # blind_restore_loss: final output 在盲区的平均 L1（保持做为评估与损失项）
                     blind_l1 = (torch.abs(center_out - center_hr_2d) * blind_mask_2d).sum() / blind_pixels
-                    blind_restore_loss = self.config.blind_restore_loss_weight * blind_l1
+                    # 使用可学习权重参数
+                    if hasattr(self.model, 'restoration_network'):
+                        rn = self.model.restoration_network
+                        blind_restore_weight = torch.nn.functional.softplus(rn.blind_restore_loss_weight_param.to(center_out.device)) if hasattr(rn, 'blind_restore_loss_weight_param') else float(getattr(self.config, 'blind_restore_loss_weight', 0.6))
+                    else:
+                        blind_restore_weight = float(getattr(self.config, 'blind_restore_loss_weight', 0.6))
+                    blind_restore_loss = blind_restore_weight * blind_l1
 
                     # lr_warping_loss: 仍使用非盲区作为监督（和原逻辑一致）
                     center_lr = lr_blur_seq[:, :, t // 2:t // 2 + 1, :, :]
@@ -432,16 +440,60 @@ class Trainer:
                         result_dict['F_sharp_D'].float(), lr_sharp_seq.float()
                     )
 
-                    # 使用配置项 blind_res_loss_weight（fallback 到 2.0）替代代码中硬编码的 2.0
-                    blind_res_loss_weight = float(getattr(self.config, 'blind_res_loss_weight', 2.0))
+                    # 使用可学习的 blind_res_loss 权重（fallback 到 config）
+                    if hasattr(self.model, 'restoration_network'):
+                        rn = self.model.restoration_network
+                        blind_res_loss_weight = torch.nn.functional.softplus(rn.blind_res_loss_weight_param.to(center_out.device)) if hasattr(rn, 'blind_res_loss_weight_param') else float(getattr(self.config, 'blind_res_loss_weight', 2.0))
+                    else:
+                        blind_res_loss_weight = float(getattr(self.config, 'blind_res_loss_weight', 2.0))
 
                     # 汇总总损失（restoration 在非盲区，盲区由 blind_res + blind_restore_loss 专门驱动）
+                    # --- 额外约束：防止盲元修复向非盲元区域溢出 ---
+                    # 构造边界带：通过膨胀盲元掩码并减去盲元掩码得到边界区域
+                    bd_kernel = int(getattr(self.config, 'boundary_dilate', 3))
+                    if bd_kernel % 2 == 0:
+                        bd_kernel = bd_kernel + 1
+                    pad = bd_kernel // 2
+                    # blind_mask_2d: [B, 1, H, W]
+                    with torch.no_grad():
+                        mask_for_dilate = blind_mask_2d.unsqueeze(1) if blind_mask_2d.dim() == 3 else blind_mask_2d
+                        dilated = F.max_pool2d(mask_for_dilate.float(), kernel_size=bd_kernel, stride=1, padding=pad)
+                        dilated = dilated.squeeze(1) if dilated.dim() == 4 else dilated
+                        boundary_mask = (dilated - blind_mask_2d).clamp(min=0.0)
+                    boundary_pixels = boundary_mask.sum().clamp_min(1.0)
+
+                    # 边界一致性损失：鼓励 final output 在边界处更接近 base_output（减少溢出替换）
+                    boundary_loss_weight = float(getattr(self.config, 'blind_boundary_loss_weight', 1.0))
+                    boundary_loss = (torch.abs(center_out - result_dict['base_output']) * boundary_mask).sum() / boundary_pixels
+
+                    # gate 平滑与稀疏约束（防止 gate 在边界处过于激进）
+                    blind_gate = result_dict.get('blind_gate', None)
+                    gate_tv_loss = torch.tensor(0.0, device=center_out.device)
+                    gate_sparsity_loss = torch.tensor(0.0, device=center_out.device)
+                    if blind_gate is not None:
+                        # blind_gate shape: [B, 1, H, W]
+                        g = blind_gate
+                        # Total variation (TV) loss on gate
+                        tv_x = torch.abs(g[:, :, :, :-1] - g[:, :, :, 1:]).mean() if g.shape[-1] > 1 else torch.tensor(0.0, device=g.device)
+                        tv_y = torch.abs(g[:, :, :-1, :] - g[:, :, 1:, :]).mean() if g.shape[-2] > 1 else torch.tensor(0.0, device=g.device)
+                        gate_tv_loss = (tv_x + tv_y)
+                        # sparsity: average gate magnitude inside blind mask (encourage not always 1)
+                        gate_sparsity_weight_cfg = float(getattr(self.config, 'blind_gate_sparsity_weight', 0.0))
+                        if gate_sparsity_weight_cfg > 0:
+                            gate_masked = (g * blind_mask_2d).sum() / blind_pixels
+                            gate_sparsity_loss = gate_masked
+
+                    gate_tv_weight = float(getattr(self.config, 'blind_gate_tv_weight', 0.01))
+
                     total_loss = (
-                        restoration_loss
+                        restoration_weight * restoration_loss
                         + blind_restore_loss
                         + (blind_res_loss * blind_res_loss_weight)
                         + recon_loss + hr_warping_loss + lr_warping_loss
                         + flow_loss + R_TA_loss + D_TA_loss
+                        + boundary_loss_weight * boundary_loss
+                        + gate_tv_weight * gate_tv_loss
+                        + float(getattr(self.config, 'blind_gate_sparsity_weight', 0.0)) * gate_sparsity_loss
                     )
 
                     self.optimizer_D.zero_grad(set_to_none=True)
@@ -524,10 +576,11 @@ class Trainer:
         report = Train_Report()
         start = time.time()
 
-        # Heavy alignment metrics can be computed less frequently than base val metrics.
+        # 对齐（光流）指标：默认不启用，避免训练/验证期间过多冗余输出与计算开销。
+        # 如需启用，请在配置文件中设置 enable_align_metrics = True 与 align_metrics_period。
         align_period = max(1, int(getattr(self.config, 'align_metrics_period', 1)))
-        compute_align_metrics = bool(getattr(self.config, 'enable_align_metrics', True)) and (
-                    (epoch + 1) % align_period == 0)
+        compute_align_metrics = bool(getattr(self.config, 'enable_align_metrics', False)) and (
+            (epoch + 1) % align_period == 0)
 
         align_before_sum = 0.0
         align_after_sum = 0.0
@@ -610,25 +663,8 @@ class Trainer:
                         blind_ratio_sum += (align_metrics['blind_ratio'] or 0.0) * bsz
                         blind_count += bsz
 
-        # 日誌記錄邏輯
+        # 日誌記錄（已移除光流/對齊的明細輸出，只保留核心指標）
         log_msg = f"VAL Epoch [{epoch}]\t" + report.val_result_str(time.time() - start)
-        if align_count > 0:
-            align_before = align_before_sum / align_count
-            align_after = align_after_sum / align_count
-            align_gain = align_gain_sum / align_count
-            align_msg = f"\tAlignBefore: {align_before:.6f}\tAlignAfter: {align_after:.6f}\tAlignGain(%): {align_gain:.3f}"
-            if epe_count > 0:
-                align_msg += f"\tEPE: {align_epe_sum / epe_count:.6f}"
-            if blind_count > 0:
-                align_msg += (
-                    f"\tBlindRatio: {blind_ratio_sum / blind_count:.4f}"
-                    f"\tBlindAlignBefore: {blind_before_sum / blind_count:.6f}"
-                    f"\tBlindAlignAfter: {blind_after_sum / blind_count:.6f}"
-                    f"\tBlindAlignGain(%): {blind_gain_sum / blind_count:.3f}"
-                )
-            log_msg += align_msg
-        elif bool(getattr(self.config, 'enable_align_metrics', True)):
-            log_msg += f"\tAlignMetrics: skipped (period={align_period})"
 
         blind_l1 = None
         blind_psnr = None
@@ -690,6 +726,29 @@ class Trainer:
                 lr_blur_seq = lr_blur_seq.cuda()
                 result_dict = self.model(lr_blur_seq)
                 output = result_dict['output']
+
+                # 推理阶段羽化处理（feather）：将模型 output 与 base_output 在 mask 边界处做平滑混合
+                if bool(getattr(self.config, 'inference_feather', False)):
+                    try:
+                        mask = result_dict.get('blind_mask', None)
+                        base_output = result_dict.get('base_output', None)
+                        if mask is not None and base_output is not None:
+                            # mask: [B, 1, H, W]
+                            ks = int(getattr(self.config, 'feather_kernel', 5))
+                            iters = int(getattr(self.config, 'feather_iters', 1))
+                            if ks % 2 == 0:
+                                ks += 1
+                            pad = ks // 2
+                            m = mask.float()
+                            # apply box blur iteratively as a cheap feather approximation
+                            for _ in range(max(1, iters)):
+                                m = F.avg_pool2d(m, kernel_size=ks, stride=1, padding=pad)
+                            # clamp to [0,1]
+                            m = m.clamp(0.0, 1.0)
+                            # blended output: base_output * (1 - m) + output * m
+                            output = base_output * (1.0 - m) + output * m
+                    except Exception as e:
+                        print(f"[!] Warning: inference feather failed: {e}")
 
                 # 4. 提取对应的输入中心帧和真值进行对比
                 input_blind = lr_blur_seq[:, :, t_idx, :, :]
@@ -904,9 +963,25 @@ class Trainer:
         torch.save(save_dict, os.path.join(self.checkpoint_path, 'latest.pt'))
 
     def save_best_model(self, epoch):
+        # 保留向后兼容接口：若传入 tag，则以 tag 区分保存文件名
+        def _save(tag=None):
+            save_dict = {'epoch': epoch, 'model_D_state_dict': self.model.degradation_learning_network.state_dict()}
+            if self.config.stage == 2:
+                save_dict['model_R_state_dict'] = self.model.restoration_network.state_dict()
+            filename = 'model_best.pt' if tag is None else f'model_best_{tag}.pt'
+            torch.save(save_dict, os.path.join(self.checkpoint_path, filename))
+
+        # 支持旧接口调用和新接口通过可选参数
+        # 如果外部希望通过关键字参数传入 tag，会被忽略（旧接口兼容）。
+        _save()
+
+    # 兼容：提供按 tag 保存的便利方法
+    def save_best_model_tagged(self, epoch, tag):
         save_dict = {'epoch': epoch, 'model_D_state_dict': self.model.degradation_learning_network.state_dict()}
-        if self.config.stage == 2: save_dict['model_R_state_dict'] = self.model.restoration_network.state_dict()
-        torch.save(save_dict, os.path.join(self.checkpoint_path, 'model_best.pt'))
+        if self.config.stage == 2:
+            save_dict['model_R_state_dict'] = self.model.restoration_network.state_dict()
+        filename = f'model_best_{tag}.pt'
+        torch.save(save_dict, os.path.join(self.checkpoint_path, filename))
 
     def load_checkpoint(self):
         latest_path = os.path.join(self.checkpoint_path, 'latest.pt')

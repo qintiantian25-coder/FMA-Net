@@ -36,6 +36,7 @@ def train(config):
 
     best_psnr = float('-inf')
     best_blind_l1 = float('inf')
+    best_blind_psnr = float('-inf')
     last_epoch = 0
     if config.finetuning:
         last_epoch = trainer.load_checkpoint()
@@ -47,10 +48,44 @@ def train(config):
         if (epoch + 1) % config.val_period == 0 or epoch == config.num_epochs - 1:
             val_result = trainer.validate(val_dataloader, val_log, epoch)
 
+            # 每次验证后打印可学习的融合/盲元参数，默认按 val_period 出现（trainer.validate 每 val_period 调用一次）
+            try:
+                if config.stage == 2 and hasattr(trainer.model, 'restoration_network'):
+                    rn = trainer.model.restoration_network
+                    # 映射到受约束的可读值
+                    alpha = float(torch.sigmoid(rn.base_alpha_param).detach().cpu().item()) if hasattr(rn, 'base_alpha_param') else float(getattr(config, 'base_alpha', 0.0))
+                    beta = float(torch.sigmoid(rn.base_beta_param).detach().cpu().item()) if hasattr(rn, 'base_beta_param') else float(getattr(config, 'base_beta', 0.0))
+                    blind_res_scale = float(torch.nn.functional.softplus(rn.blind_res_scale_param).detach().cpu().item()) if hasattr(rn, 'blind_res_scale_param') else float(getattr(config, 'blind_res_scale', 0.0))
+                    # 读取可学习的损失权重（softplus 映射为正），fallback 到配置
+                    # restoration weight is fixed in config (not learned) to protect non-blind regions
+                    restoration_w = float(getattr(config, 'restoration_loss_weight', 1.0))
+                    try:
+                        blind_restore_w = float(torch.nn.functional.softplus(rn.blind_restore_loss_weight_param).detach().cpu().item()) if hasattr(rn, 'blind_restore_loss_weight_param') else float(getattr(config, 'blind_restore_loss_weight', 0.6))
+                    except Exception:
+                        blind_restore_w = float(getattr(config, 'blind_restore_loss_weight', 0.6))
+                    try:
+                        blind_res_w = float(torch.nn.functional.softplus(rn.blind_res_loss_weight_param).detach().cpu().item()) if hasattr(rn, 'blind_res_loss_weight_param') else float(getattr(config, 'blind_res_loss_weight', 2.0))
+                    except Exception:
+                        blind_res_w = float(getattr(config, 'blind_res_loss_weight', 2.0))
+
+                    line = (
+                        f"VAL Epoch [{epoch + 1}] alpha: {alpha:.4f} | beta: {beta:.4f} | blind_res_scale: {blind_res_scale:.3f}"
+                        f" | restoration_w: {restoration_w:.3f} | blind_restore_w: {blind_restore_w:.3f} | blind_res_w: {blind_res_w:.3f}"
+                    )
+                    print(line)
+                    # 同时写入验证日志文件，便于后续分析
+                    try:
+                        val_log.write(line)
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"[!] Warning: failed to print fusion params after validation: {e}")
+
             # validate 支持返回字典: 主指标(PSNR) + 盲元兜底指标(BlindL1/BlindPSNR)。
             if isinstance(val_result, dict):
                 current_psnr = float(val_result.get('val_psnr', float('-inf')))
                 current_blind_l1 = val_result.get('blind_l1', None)
+                current_blind_psnr = val_result.get('blind_psnr', None)
             elif isinstance(val_result, (list, tuple)):
                 current_psnr = val_result[0]
                 current_blind_l1 = None
@@ -82,21 +117,55 @@ def train(config):
             # 主指标优先；主指标接近持平时，用 BlindL1 更低者作为兜底优胜。
             better_by_psnr = current_psnr > (best_psnr + psnr_eps)
             tie_on_psnr = abs(current_psnr - best_psnr) <= psnr_eps
-            better_by_blind = (
+
+            # Prefer higher blind_psnr as first tiebreaker (if available), then lower blind_l1
+            better_by_blindpsnr = (
                 tie_on_psnr and
+                current_blind_psnr is not None and
+                (current_blind_psnr > best_blind_psnr + psnr_eps)
+            )
+
+            better_by_blindl1 = (
+                tie_on_psnr and
+                current_blind_psnr is None and
                 current_blind_l1 is not None and
                 (current_blind_l1 + blind_eps) < best_blind_l1
             )
 
-            if better_by_psnr or better_by_blind:
+            # Parallel saving strategy:
+            # - keep best by PSNR
+            # - keep best by blind PSNR (if available)
+            # This ensures we don't lose models that are specialized for blind-pixel recovery.
+            saved_any = False
+
+            if better_by_psnr:
                 best_psnr = current_psnr
-                if current_blind_l1 is not None:
-                    best_blind_l1 = current_blind_l1
+                # legacy save (model_best.pt) and dedicated PSNR copy
                 trainer.save_best_model(epoch)
-                if current_blind_l1 is not None:
-                    print(f"[*] New Best saved at Epoch {epoch + 1} | PSNR: {best_psnr:.3f}, BlindL1: {best_blind_l1:.6f}")
-                else:
-                    print(f"[*] New Best PSNR: {best_psnr:.3f} saved at Epoch {epoch + 1}")
+                try:
+                    trainer.save_best_model_tagged(epoch, 'psnr')
+                except Exception:
+                    pass
+                saved_any = True
+                print(f"[*] New Best PSNR saved at Epoch {epoch + 1} | PSNR: {best_psnr:.3f}")
+
+            if better_by_blindpsnr and current_blind_psnr is not None:
+                best_blind_psnr = current_blind_psnr
+                try:
+                    trainer.save_best_model_tagged(epoch, 'blindpsnr')
+                except Exception:
+                    pass
+                saved_any = True
+                print(f"[*] New Best BlindPSNR saved at Epoch {epoch + 1} | BlindPSNR: {best_blind_psnr:.3f}")
+
+            # If PSNR tie but blind_l1 improved and blind_psnr not available, optionally save blindL1-best
+            if (not saved_any) and better_by_blindl1:
+                best_blind_l1 = current_blind_l1
+                try:
+                    trainer.save_best_model_tagged(epoch, 'blindl1')
+                except Exception:
+                    pass
+                print(f"[*] New Best BlindL1 saved at Epoch {epoch + 1} | BlindL1: {best_blind_l1:.6f}")
 
 
 def test(config):
