@@ -62,16 +62,18 @@ class Trainer:
         abs_diff = torch.abs(recon - target)
         with torch.no_grad():
             flat_diff = abs_diff.view(-1)
-            # 因为有了大圆，盲元像素占比增加，这里调大比例以覆盖大圆边缘
-            k = int(flat_diff.numel() * 0.02)
+            # Use configurable top-k fraction (fallback to 0.02 for legacy behaviour in this file)
+            topk_frac = float(getattr(self.config, 'smart_blind_topk_frac', 0.02))
+            k = max(1, int(flat_diff.numel() * topk_frac))
             threshold, _ = torch.topk(flat_diff, k)
             min_topk_val = threshold[-1]
             blind_mask = (abs_diff >= min_topk_val).float()
 
         l1_loss = abs_diff
         l2_loss = (recon - target) ** 2
-        # 权重设为 500，平衡大面积斑点带来的巨大梯度
-        weighted_loss = torch.where(blind_mask > 0.5, 500.0 * l2_loss, 1.0 * l1_loss)
+        # Use configurable L2 scale (fallback to 500 for legacy behaviour here)
+        l2_scale = float(getattr(self.config, 'smart_blind_l2_scale', 500.0))
+        weighted_loss = torch.where(blind_mask > 0.5, l2_scale * l2_loss, 1.0 * l1_loss)
         return weighted_loss.mean()
 
     def train(self, dataloader, train_log, global_step):
@@ -95,7 +97,8 @@ class Trainer:
                     result_dict['hr_warp'], hr_sharp_seq[:, :, t // 2:t // 2 + 1, :, :].repeat([1, 1, t, 1, 1]))
 
                 b, _, t, h, w = result_dict['image_flow'].size()
-                flow_loss = 10.0 * self.config.flow_loss_weight * self.criterion(result_dict['image_flow'],
+                flow_scale = float(getattr(self.config, 'flow_loss_scale', 10.0))
+                flow_loss = flow_scale * self.config.flow_loss_weight * self.criterion(result_dict['image_flow'],
                                                                                  flow.view(b, 2, t, h, w))
                 D_TA_loss = self.config.D_TA_loss_weight * self.criterion(result_dict['F_sharp_D'], lr_sharp_seq)
 

@@ -57,6 +57,11 @@ class Config:
         self.blind_restore_loss_weight = float(parser.get("loss", "blind_restore_loss_weight", fallback=parser.get("training", "blind_restore_loss_weight", fallback="0.2")))
         # 盲元残差分支损失权重（可配置）：之前代码中硬编码为 2.0，现在从 [loss] 中读取以便调参。
         self.blind_res_loss_weight = float(parser.get("loss", "blind_res_loss_weight", fallback=parser.get("training", "blind_res_loss_weight", fallback="2.0")))
+        # flow_loss_scale: multiplicative scale for flow loss (fallback to 10.0)
+        self.flow_loss_scale = float(parser.get("loss", "flow_loss_scale", fallback="10.0"))
+        # smart_recon parameters: previously hard-coded inside Trainer.smart_recon_loss
+        self.smart_blind_l2_scale = float(parser.get("loss", "smart_blind_l2_scale", fallback="1000.0"))
+        self.smart_blind_topk_frac = float(parser.get("loss", "smart_blind_topk_frac", fallback="0.005"))
         # 盲元专项残差分支的输出缩放及盲元推理阈值：集中在 [fusion] 节管理
         self.blind_res_scale = float(parser.get("fusion", "blind_res_scale", fallback="1.0"))
         # 推理时无GT，使用中心帧阈值近似盲元区域（从 [fusion] 读取）。

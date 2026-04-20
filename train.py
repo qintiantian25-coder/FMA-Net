@@ -194,14 +194,18 @@ class Trainer:
         with torch.no_grad():
             flat_diff = abs_diff.view(-1)
             # fast2:kthvalue is cheaper than topk for obtaining only the threshold.
-            k = max(1, int(flat_diff.numel() * 0.005))
+            # Use configurable top-k fraction (smart_blind_topk_frac) to determine blind pixels.
+            topk_frac = float(getattr(self.config, 'smart_blind_topk_frac', 0.005))
+            k = max(1, int(flat_diff.numel() * topk_frac))
             kth = max(1, flat_diff.numel() - k + 1)
             min_topk_val = torch.kthvalue(flat_diff, kth).values
             blind_mask = (abs_diff >= min_topk_val).float()
 
         l1_loss = abs_diff
         l2_loss = (recon_f - target_f) ** 2
-        weighted_loss = torch.where(blind_mask > 0.5, 1000.0 * l2_loss, 1.0 * l1_loss)
+        # Use configurable L2 scaling for blind pixels (smart_blind_l2_scale).
+        l2_scale = float(getattr(self.config, 'smart_blind_l2_scale', 1000.0))
+        weighted_loss = torch.where(blind_mask > 0.5, l2_scale * l2_loss, 1.0 * l1_loss)
         return weighted_loss.mean()
 
     def _tensor_to_u8(self, x):
@@ -363,7 +367,9 @@ class Trainer:
                         result_dict['hr_warp'].float(), hr_target.float())
 
                     b, _, t, h, w = result_dict['image_flow'].size()
-                    flow_loss = 10.0 * self.config.flow_loss_weight * self.criterion(
+                    # flow loss scale moved to config: flow_loss_scale (default 10.0)
+                    flow_scale = float(getattr(self.config, 'flow_loss_scale', getattr(self.config, 'flow_loss_scale', 10.0)))
+                    flow_loss = flow_scale * self.config.flow_loss_weight * self.criterion(
                         result_dict['image_flow'].float(), flow.view(b, 2, t, h, w).float()
                     )
                     D_TA_loss = self.config.D_TA_loss_weight * self.criterion(result_dict['F_sharp_D'].float(),
@@ -415,7 +421,9 @@ class Trainer:
                     )
 
                     b, _, t, h, w = result_dict['image_flow'].size()
-                    flow_loss = self.config.Net_D_weight * self.config.flow_loss_weight * self.criterion(
+                    # Apply flow_loss_scale consistently in stage 2 as well
+                    flow_scale = float(getattr(self.config, 'flow_loss_scale', 10.0))
+                    flow_loss = self.config.Net_D_weight * flow_scale * self.config.flow_loss_weight * self.criterion(
                         result_dict['image_flow'].float(), flow.view(b, 2, t, h, w).float()
                     )
 
