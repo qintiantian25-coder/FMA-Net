@@ -43,16 +43,20 @@ class Config:
         self.scale = int(parser.get('training', 'scale'))
         self.num_seq = int(parser.get('training', 'num_seq'))
 
-        self.lr_warping_loss_weight = float(parser.get("training", "lr_warping_loss_weight"))
-        self.hr_warping_loss_weight = float(parser.get("training", "hr_warping_loss_weight"))
-        self.flow_loss_weight = float(parser.get("training", "flow_loss_weight"))
-        self.D_TA_loss_weight = float(parser.get("training", "D_TA_loss_weight"))
-        self.R_TA_loss_weight = float(parser.get("training", "R_TA_loss_weight"))
-        self.Net_D_weight = float(parser.get("training", "Net_D_weight"))
+        # --- Loss weights: centralized in [loss] section for easy tuning ---
+        # These weights are used to compose total_loss in training stage.
+        self.lr_warping_loss_weight = float(parser.get("loss", "lr_warping_loss_weight", fallback="0.0"))
+        self.hr_warping_loss_weight = float(parser.get("loss", "hr_warping_loss_weight", fallback="0.0"))
+        self.flow_loss_weight = float(parser.get("loss", "flow_loss_weight", fallback="0.0"))
+        self.D_TA_loss_weight = float(parser.get("loss", "D_TA_loss_weight", fallback="0.0"))
+        self.R_TA_loss_weight = float(parser.get("loss", "R_TA_loss_weight", fallback="0.0"))
+        self.Net_D_weight = float(parser.get("loss", "Net_D_weight", fallback="0.0"))
         # 盲元判定阈值：用于 stage-2 的 mask 监督与盲元区域对齐统计。
-        self.blind_mask_threshold = float(parser.get("training", "blind_mask_threshold", fallback="0.08"))
+        self.blind_mask_threshold = float(parser.get("loss", "blind_mask_threshold", fallback=parser.get("training", "blind_mask_threshold", fallback="0.08")))
         # Stage-2 盲元专项分支损失权重：仅对盲元掩码区域生效。
-        self.blind_restore_loss_weight = float(parser.get("training", "blind_restore_loss_weight", fallback="0.2"))
+        self.blind_restore_loss_weight = float(parser.get("loss", "blind_restore_loss_weight", fallback=parser.get("training", "blind_restore_loss_weight", fallback="0.2")))
+        # 盲元残差分支损失权重（可配置）：之前代码中硬编码为 2.0，现在从 [loss] 中读取以便调参。
+        self.blind_res_loss_weight = float(parser.get("loss", "blind_res_loss_weight", fallback=parser.get("training", "blind_res_loss_weight", fallback="2.0")))
         # 盲元专项残差分支的输出缩放及盲元推理阈值：集中在 [fusion] 节管理
         self.blind_res_scale = float(parser.get("fusion", "blind_res_scale", fallback="1.0"))
         # 推理时无GT，使用中心帧阈值近似盲元区域（从 [fusion] 读取）。
