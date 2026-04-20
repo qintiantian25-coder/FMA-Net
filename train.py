@@ -664,7 +664,8 @@ class Trainer:
                         blind_count += bsz
 
         # 日誌記錄（已移除光流/對齊的明細輸出，只保留核心指標）
-        log_msg = f"VAL Epoch [{epoch}]\t" + report.val_result_str(time.time() - start)
+        # 统一为 1-based epoch 显示，和 main.py 中的打印保持一致
+        log_msg = f"VAL Epoch [{epoch + 1}]\t" + report.val_result_str(time.time() - start)
 
         blind_l1 = None
         blind_psnr = None
