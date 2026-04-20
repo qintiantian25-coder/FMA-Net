@@ -554,7 +554,7 @@ class Net_R(torch.nn.Module):
         # Map learnable params to constrained ranges and place on same device as features
         base_alpha = torch.sigmoid(self.base_alpha_param).to(Fw.device)
         base_beta = torch.sigmoid(self.base_beta_param).to(Fw.device)
-        blind_res_scale = F.softplus(self.blind_res_scale_param).to(Fw.device)
+        blind_res_scale = torch.nn.functional.softplus(self.blind_res_scale_param).to(Fw.device)
 
         # scaled blind residual
         blind_res = raw_blind_res * blind_res_scale
