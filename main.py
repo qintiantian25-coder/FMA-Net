@@ -72,12 +72,12 @@ def train(config):
                         f"VAL Epoch [{epoch + 1}] alpha: {alpha:.4f} | beta: {beta:.4f} | blind_res_scale: {blind_res_scale:.3f}"
                         f" | restoration_w: {restoration_w:.3f} | blind_restore_w: {blind_restore_w:.3f} | blind_res_w: {blind_res_w:.3f}"
                     )
-                    print(line)
-                    # 同时写入验证日志文件，便于后续分析
+                    # 只通过 val_log.write 输出（Train_Report.write 会打印到控制台并写入文件），避免重复打印
                     try:
                         val_log.write(line)
                     except Exception:
-                        pass
+                        # 兜底：如果写日志失败，至少打印到控制台一次
+                        print(line)
             except Exception as e:
                 print(f"[!] Warning: failed to print fusion params after validation: {e}")
 
@@ -118,9 +118,11 @@ def train(config):
             better_by_psnr = current_psnr > (best_psnr + psnr_eps)
             tie_on_psnr = abs(current_psnr - best_psnr) <= psnr_eps
 
-            # Prefer higher blind_psnr as first tiebreaker (if available), then lower blind_l1
+            # Prefer higher blind_psnr as an independent criterion as well.
+            # 原先逻辑仅在 PSNR 持平时把 blind_psnr 作为 tiebreaker，这会导致当 PSNR 同时更好
+            # 并保存 model_best.pt 时不会单独生成 blind-optimized 副本。这里改为独立判断：
+            # 只要 current_blind_psnr 比历史 best_blind_psnr 明显更好，就保存 tagged blindpsnr 模型。
             better_by_blindpsnr = (
-                tie_on_psnr and
                 current_blind_psnr is not None and
                 (current_blind_psnr > best_blind_psnr + psnr_eps)
             )
@@ -136,36 +138,40 @@ def train(config):
             # - keep best by PSNR
             # - keep best by blind PSNR (if available)
             # This ensures we don't lose models that are specialized for blind-pixel recovery.
-            saved_any = False
+            # 保存策略调整：保留三类模型
+            # - model_best_psnr.pt: PSNR 最优（独立保存）
+            # - model_best_blindpsnr.pt: Blind PSNR 最优（独立保存）
+            # - model_best.pt: 仅当 PSNR 和 BlindPSNR 同时都比历史最好更好时保存
+            # 这样可以避免重复保存相同文件并满足你只保留三个模型的需求。
+
+            psnr_saved = False
+            blindpsnr_saved = False
 
             if better_by_psnr:
                 best_psnr = current_psnr
-                # legacy save (model_best.pt) and dedicated PSNR copy
-                trainer.save_best_model(epoch)
                 try:
                     trainer.save_best_model_tagged(epoch, 'psnr')
+                    psnr_saved = True
                 except Exception:
                     pass
-                saved_any = True
                 print(f"[*] New Best PSNR saved at Epoch {epoch + 1} | PSNR: {best_psnr:.3f}")
 
             if better_by_blindpsnr and current_blind_psnr is not None:
                 best_blind_psnr = current_blind_psnr
                 try:
                     trainer.save_best_model_tagged(epoch, 'blindpsnr')
+                    blindpsnr_saved = True
                 except Exception:
                     pass
-                saved_any = True
                 print(f"[*] New Best BlindPSNR saved at Epoch {epoch + 1} | BlindPSNR: {best_blind_psnr:.3f}")
 
-            # If PSNR tie but blind_l1 improved and blind_psnr not available, optionally save blindL1-best
-            if (not saved_any) and better_by_blindl1:
-                best_blind_l1 = current_blind_l1
+            # 只有当 PSNR 与 BlindPSNR 同时提升时，更新并保存通用 model_best.pt
+            if better_by_psnr and better_by_blindpsnr and current_blind_psnr is not None:
                 try:
-                    trainer.save_best_model_tagged(epoch, 'blindl1')
+                    trainer.save_best_model(epoch)
+                    print(f"[*] New Best (PSNR+BlindPSNR) saved at Epoch {epoch + 1}")
                 except Exception:
                     pass
-                print(f"[*] New Best BlindL1 saved at Epoch {epoch + 1} | BlindL1: {best_blind_l1:.6f}")
 
 
 def test(config):
