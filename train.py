@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 import re
 from utils import Train_Report, TestReport, SaveManager
+from model import feather_mask_gaussian, feather_mask_distance, laplacian_blend_np
 
 
 class Trainer:
@@ -728,28 +729,106 @@ class Trainer:
                 result_dict = self.model(lr_blur_seq)
                 output = result_dict['output']
 
-                # 推理阶段羽化处理（feather）：将模型 output 与 base_output 在 mask 边界处做平滑混合
-                if bool(getattr(self.config, 'inference_feather', False)):
+                # --- 选择性羽化小实验（仅在配置中启用，对前 K 张图片做羽化用于对比） ---
+                sel_count = int(getattr(self.config, 'inference_feather_select_count', 0))
+                if sel_count > 0 and idx < sel_count:
                     try:
+                        # required model internals
                         mask = result_dict.get('blind_mask', None)
-                        base_output = result_dict.get('base_output', None)
-                        if mask is not None and base_output is not None:
-                            # mask: [B, 1, H, W]
-                            ks = int(getattr(self.config, 'feather_kernel', 5))
-                            iters = int(getattr(self.config, 'feather_iters', 1))
+                        res_branch = result_dict.get('res', None)
+                        duf_branch = result_dict.get('duf_output', None)
+                        blind_res = result_dict.get('blind_res', None)
+
+                        if mask is None or res_branch is None or duf_branch is None or blind_res is None:
+                            raise RuntimeError('Model did not return required branches for selective feathering')
+
+                        rn = getattr(self.model, 'restoration_network', None)
+                        if rn is not None and hasattr(rn, 'base_alpha_param') and hasattr(rn, 'base_beta_param'):
+                            base_alpha = torch.sigmoid(rn.base_alpha_param).to(res_branch.device)
+                            base_beta = torch.sigmoid(rn.base_beta_param).to(res_branch.device)
+                        else:
+                            base_alpha = float(getattr(self.config, 'base_alpha', 0.8))
+                            base_beta = float(getattr(self.config, 'base_beta', 0.2))
+
+                        blind_area_fill = (base_alpha * duf_branch) + (base_beta * res_branch) + blind_res
+
+                        feather_mode = str(getattr(self.config, 'feather_mode', 'distance')).lower()
+                        output_feathered = None
+
+                        if feather_mode == 'gaussian':
+                            ks = int(getattr(self.config, 'feather_kernel', 15))
+                            sigma = float(getattr(self.config, 'feather_sigma', 3.0))
                             if ks % 2 == 0:
                                 ks += 1
-                            pad = ks // 2
-                            m = mask.float()
-                            # apply box blur iteratively as a cheap feather approximation
-                            for _ in range(max(1, iters)):
-                                m = F.avg_pool2d(m, kernel_size=ks, stride=1, padding=pad)
-                            # clamp to [0,1]
-                            m = m.clamp(0.0, 1.0)
-                            # blended output: base_output * (1 - m) + output * m
-                            output = base_output * (1.0 - m) + output * m
+                            feather_m = feather_mask_gaussian(mask.float().squeeze(1) if mask.dim() == 4 else mask.float(), kernel_size=ks, sigma=sigma)
+                            feather_m_c = feather_m.repeat(1, res_branch.shape[1], 1, 1)
+                            output_feathered = (1.0 - feather_m_c) * res_branch + feather_m_c * blind_area_fill
+
+                        elif feather_mode == 'distance':
+                            # distance-transform based soft mask (uses model helper; will raise if scipy missing)
+                            band = int(getattr(self.config, 'feather_band_width', 5))
+                            feather_m = feather_mask_distance(mask.float().squeeze(1) if mask.dim() == 4 else mask.float(), band_width=band)
+                            feather_m = feather_m.to(res_branch.device)
+                            feather_m_c = feather_m.repeat(1, res_branch.shape[1], 1, 1)
+                            output_feathered = (1.0 - feather_m_c) * res_branch + feather_m_c * blind_area_fill
+
+                        elif feather_mode == 'laplacian':
+                            # Laplacian pyramid blending (per-sample, CPU via numpy + cv2)
+                            levels = int(getattr(self.config, 'feather_laplacian_levels', 4))
+                            out_list = []
+                            Bn = res_branch.shape[0]
+                            for bi in range(Bn):
+                                res_np = res_branch[bi].detach().cpu().numpy()  # C,H,W
+                                duf_np = blind_area_fill[bi].detach().cpu().numpy()
+                                # assume single-channel or take first channel
+                                if res_np.ndim == 3:
+                                    res_chan = res_np[0]
+                                    duf_chan = duf_np[0]
+                                else:
+                                    res_chan = res_np
+                                    duf_chan = duf_np
+                                mask_np = (mask[bi].detach().cpu().numpy() > 0.5).astype(np.float32)
+                                if mask_np.ndim == 3:
+                                    mask_np = mask_np[0]
+                                blended = laplacian_blend_np(res_chan, duf_chan, mask_np, levels=levels)
+                                out_list.append(blended)
+                            out_np_stack = np.stack(out_list, axis=0)[:, np.newaxis, :, :]
+                            output_feathered = torch.from_numpy(out_np_stack).to(res_branch.device).float()
+
+                        else:
+                            raise ValueError(f'Unknown feather_mode: {feather_mode}')
+
+                        # save feathered images
+                        if output_feathered is not None:
+                            import torchvision
+                            input_blind = lr_blur_seq[:, :, t_idx, :, :]
+                            try:
+                                current_frame_name_local = current_frame_name
+                            except Exception:
+                                current_frame_name_local = f"feather_idx_{idx}.png"
+                            gt_path = None
+                            try:
+                                gt_path = gt_finder.get(current_frame_name_local)
+                            except Exception:
+                                gt_path = None
+
+                            if gt_path and os.path.exists(gt_path):
+                                gt_img = cv2.imread(gt_path, cv2.IMREAD_GRAYSCALE)
+                                gt_tensor = torch.from_numpy(gt_img).float() / 255.0
+                                gt_tensor = gt_tensor.unsqueeze(0).unsqueeze(0).cuda()
+                                if output_feathered.shape != gt_tensor.shape:
+                                    output_feathered = F.interpolate(output_feathered, size=(gt_tensor.shape[2], gt_tensor.shape[3]), mode='bilinear')
+                                if input_blind.shape != gt_tensor.shape:
+                                    input_blind = F.interpolate(input_blind, size=(gt_tensor.shape[2], gt_tensor.shape[3]), mode='bilinear')
+                                comparison = torch.cat([input_blind, output_feathered, gt_tensor], dim=3)
+                                torchvision.utils.save_image(comparison, os.path.join(save_triple, f"feather_triple_{current_frame_name_local}"))
+                                torchvision.utils.save_image(output_feathered, os.path.join(save_pure, f"feather_{current_frame_name_local}"))
+                            else:
+                                torchvision.utils.save_image(output_feathered, os.path.join(save_pure, f"feather_{current_frame_name_local}"))
                     except Exception as e:
-                        print(f"[!] Warning: inference feather failed: {e}")
+                        print(f"[!] Warning: selective feather failed for idx={idx}: {e}")
+
+                # 原来的全量 box-blur 羽化逻辑已移除，测试/推理默认不进行羽化。
 
                 # 4. 提取对应的输入中心帧和真值进行对比
                 input_blind = lr_blur_seq[:, :, t_idx, :, :]
@@ -778,6 +857,8 @@ class Trainer:
 
                 if (idx + 1) % 10 == 0:
                     print(f"进度: {idx + 1}/{len(dataloader)} | 正在保存: {current_frame_name}")
+
+    pass
 
     def test_quantitative_result(self, gt_dir, output_dir, image_border):
         from utils import TestReport

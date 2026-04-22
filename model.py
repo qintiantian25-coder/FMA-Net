@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 import numbers
 from einops import rearrange
 
@@ -16,6 +17,134 @@ def to_3d(x):
 
 def to_4d(x, h, w):
     return rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
+
+
+def gaussian_kernel(kernel_size=15, sigma=3.0, device='cpu', dtype=torch.float32):
+    """Generate a 2D Gaussian kernel tensor of shape (1,1,ks,ks)."""
+    ax = torch.arange(-(kernel_size // 2), kernel_size // 2 + 1, device=device, dtype=dtype)
+    xx, yy = torch.meshgrid(ax, ax, indexing='xy')
+    kernel = torch.exp(-(xx ** 2 + yy ** 2) / (2 * sigma * sigma))
+    kernel = kernel / kernel.sum()
+    return kernel.view(1, 1, kernel_size, kernel_size)
+
+
+def feather_mask_gaussian(mask, kernel_size=15, sigma=3.0):
+    """
+    Apply Gaussian feathering to a binary mask tensor.
+    - mask: tensor shaped (B, H, W) or (B,1,H,W), values in [0,1]
+    - returns: feathered mask shaped (B,1,H,W) clipped to [0,1]
+    """
+    if mask.dim() == 3:
+        mask = mask.unsqueeze(1)
+    B, C, H, W = mask.shape
+    device = mask.device
+    dtype = mask.dtype
+    ks = int(kernel_size)
+    kernel = gaussian_kernel(ks, float(sigma), device=device, dtype=dtype)
+    pad = ks // 2
+    # conv2d expects (B,C,H,W) and kernel shape (out_ch, in_ch, kh, kw)
+    # here out_ch=in_ch=1, so use groups=C if needed; convert to single channel
+    if C != 1:
+        mask = mask.mean(dim=1, keepdim=True)
+    feather = F.conv2d(mask, kernel.to(device=device, dtype=dtype), padding=pad)
+    feather = feather.clamp(0.0, 1.0)
+    return feather
+
+
+def feather_mask_distance(mask, band_width=5):
+    """
+    Create a soft feather mask based on signed distance transform.
+    - mask: torch tensor (B,1,H,W) or (B,H,W) or numpy array
+    - band_width: half-width (in pixels) of transition band; larger -> wider transition
+    Returns: torch tensor (B,1,H,W) float32 in [0,1]
+    """
+    need_numpy = False
+    if isinstance(mask, torch.Tensor):
+        m = mask.detach().cpu().numpy()
+        need_numpy = True
+    else:
+        m = mask
+
+    try:
+        from scipy import ndimage
+    except Exception as e:
+        raise RuntimeError('feather_mask_distance requires scipy (scipy.ndimage). Install scipy or use gaussian mode.')
+
+    if m.ndim == 3:
+        # B, H, W or 1,H,W
+        if m.shape[0] == 1 or m.shape[0] == m.shape[1]:
+            pass
+    # ensure shape B x 1 x H x W
+    if m.ndim == 3:
+        if m.shape[0] == 1 or m.shape[0] > 1 and m.shape[1] != m.shape[2]:
+            # assume (B, H, W)
+            m = m[:, np.newaxis, :, :]
+        else:
+            m = m[np.newaxis, ...]
+    if m.ndim == 2:
+        m = m[np.newaxis, np.newaxis, :, :]
+
+    B = m.shape[0]
+    out = np.zeros((B, 1, m.shape[-2], m.shape[-1]), dtype=np.float32)
+    for i in range(B):
+        mask_i = m[i]
+        if mask_i.ndim == 3:
+            mask_i = mask_i[0]
+        bin_m = (mask_i > 0.5).astype(np.uint8)
+        dist_in = ndimage.distance_transform_edt(bin_m)
+        dist_out = ndimage.distance_transform_edt(1 - bin_m)
+        sd = dist_in - dist_out
+        ramp = 0.5 * (sd.astype(np.float32) / float(max(1, band_width))) + 0.5
+        ramp = np.clip(ramp, 0.0, 1.0)
+        out[i, 0] = ramp
+
+    out_t = torch.from_numpy(out)
+    if need_numpy:
+        return out_t
+    return out_t
+
+
+def laplacian_blend_np(A, B, M, levels=4):
+    """
+    Laplacian pyramid blending for single-channel images.
+    A, B, M: numpy arrays HxW in float32 (values in [0,1])
+    returns blended numpy HxW float32
+    """
+    import cv2
+    # build gaussian pyramids
+    gpA = [A.astype(np.float32)]
+    gpB = [B.astype(np.float32)]
+    gpM = [M.astype(np.float32)]
+    for i in range(levels):
+        gpA.append(cv2.pyrDown(gpA[-1]))
+        gpB.append(cv2.pyrDown(gpB[-1]))
+        gpM.append(cv2.pyrDown(gpM[-1]))
+
+    # build laplacian pyramids
+    lpA = []
+    lpB = []
+    for i in range(levels):
+        size = (gpA[i].shape[1], gpA[i].shape[0])
+        GA_expanded = cv2.pyrUp(gpA[i+1], dstsize=size)
+        GB_expanded = cv2.pyrUp(gpB[i+1], dstsize=size)
+        lpA.append(gpA[i] - GA_expanded)
+        lpB.append(gpB[i] - GB_expanded)
+    lpA.append(gpA[-1])
+    lpB.append(gpB[-1])
+
+    # blend pyramids
+    LS = []
+    for la, lb, gm in zip(lpA, lpB, gpM[:len(lpA)]):
+        if gm.shape != la.shape:
+            gm = cv2.resize(gm, (la.shape[1], la.shape[0]))
+        LS.append(la * gm + lb * (1.0 - gm))
+
+    # reconstruct
+    res = LS[-1]
+    for l in reversed(LS[:-1]):
+        size = (l.shape[1], l.shape[0])
+        res = cv2.pyrUp(res, dstsize=size) + l
+    return np.clip(res, 0.0, 1.0)
 
 
 class DynamicDownsampling(torch.nn.Module):
@@ -588,7 +717,8 @@ class Net_R(torch.nn.Module):
 
         base_output = duf_output + res  # 僅供監控
         anchor = self.a_conv(F)
-        return output, warped_X, anchor, blind_res, blind_gate, final_blind_mask, base_output
+        # 返回额外的 res 与 duf_output，便于验证阶段在外部对部分样本做羽化比较
+        return output, warped_X, anchor, blind_res, blind_gate, final_blind_mask, base_output, res, duf_output
 
 
 class FMANet(torch.nn.Module):
@@ -615,7 +745,7 @@ class FMANet(torch.nn.Module):
         if self.stage == 1:
             return result_dict
         elif self.stage == 2:
-            output, warped_X, anchor_R, blind_res, blind_gate, blind_mask_used, base_output = self.restoration_network(
+            output, warped_X, anchor_R, blind_res, blind_gate, blind_mask_used, base_output, res, duf_output = self.restoration_network(
                 x, F, f, KD, blind_mask=blind_mask
             )
             result_dict['output'] = output
@@ -625,4 +755,7 @@ class FMANet(torch.nn.Module):
             result_dict['blind_gate'] = blind_gate
             result_dict['blind_mask'] = blind_mask_used
             result_dict['base_output'] = base_output
+            # expose internal branches for optional evaluation/post-processing (e.g. selective feathering)
+            result_dict['res'] = res
+            result_dict['duf_output'] = duf_output
             return result_dict
