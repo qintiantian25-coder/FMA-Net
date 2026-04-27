@@ -272,6 +272,7 @@ class LayerNorm(nn.Module):
         return to_4d(self.body(to_3d(x)), h, w)
 
 
+# ========================== 原始 FeedForward (已是 GDFN) ==========================
 class FeedForward(nn.Module):
     def __init__(self, dim, ffn_expansion_factor, bias):
         super(FeedForward, self).__init__()
@@ -289,34 +290,56 @@ class FeedForward(nn.Module):
         return x
 
 
+# ========================== 原始交叉注意力 (用于 Net_D) ==========================
 class Attention(nn.Module):
-    """
-    Restormer-style MDTA (Multi-DConv Head Transposed Attention) adapted to accept
-    an optional guidance tensor `f`. If `f` is provided we add it to the attention input
-    (x + f) so existing cross-attention call sites remain compatible.
-
-    Behavior: compute q/k/v from the same input (self-attention along channel heads),
-    use depthwise 3x3 conv for locality, normalize q/k (L2) and scale by a learnable
-    per-head temperature before softmax.
-    """
     def __init__(self, dim, num_heads, bias):
         super(Attention, self).__init__()
         self.num_heads = num_heads
         self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
+        self.q = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
+        self.q_dwconv = nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=1, groups=dim, bias=bias)
+        self.kv_conv = nn.Conv2d(dim, dim * 2, kernel_size=1, bias=bias)
+        self.kv_dwconv = nn.Conv2d(dim * 2, dim * 2, kernel_size=3, stride=1, padding=1, groups=dim * 2, bias=bias)
+        self.project_out = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
 
-        # qkv in one conv followed by depthwise conv (preserves spatial info)
+    def forward(self, x, f):
+        b, c, h, w = x.shape
+        q = self.q_dwconv(self.q(f))
+        kv = self.kv_dwconv(self.kv_conv(x))
+        k, v = kv.chunk(2, dim=1)
+        q = rearrange(q, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+        k = rearrange(k, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+        v = rearrange(v, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+        q = torch.nn.functional.normalize(q, dim=-1)
+        k = torch.nn.functional.normalize(k, dim=-1)
+        attn = (q @ k.transpose(-2, -1)) * self.temperature
+        attn = attn.softmax(dim=-1)
+        out = (attn @ v)
+        out = rearrange(out, 'b head c (h w) -> b (head c) h w', head=self.num_heads, h=h, w=w)
+        out = self.project_out(out)
+        return out
+
+
+# ========================== Restormer 风格注意力 (MDTA，用于 Net_R) ==========================
+class RestormerAttention(nn.Module):
+    """
+    Restormer-style MDTA: computes self-attention over channel projections.
+    If f is provided, it is added to x (x + f) to keep compatibility with existing calls.
+    """
+    def __init__(self, dim, num_heads, bias):
+        super(RestormerAttention, self).__init__()
+        self.num_heads = num_heads
+        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
+
         self.qkv = nn.Conv2d(dim, dim * 3, kernel_size=1, bias=bias)
         self.qkv_dwconv = nn.Conv2d(dim * 3, dim * 3, kernel_size=3, stride=1, padding=1,
                                      groups=dim * 3, bias=bias)
         self.project_out = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
 
     def forward(self, x, f=None):
-        # x: context tensor (b, c, h, w)
-        # f: optional guidance/query tensor (b, c, h, w) — will be added to x if provided
         if f is None:
             x_in = x
         else:
-            # keep shape and device consistent
             x_in = x + f
 
         b, c, h, w = x_in.shape
@@ -328,49 +351,49 @@ class Attention(nn.Module):
         k = rearrange(k, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
         v = rearrange(v, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
 
-        # normalize along token dimension (h*w)
         q = torch.nn.functional.normalize(q, dim=-1)
         k = torch.nn.functional.normalize(k, dim=-1)
 
-        # Channel-wise attention (Restormer-style): compute attention over channel projections
-        # q: [B, head, C, HW], k: [B, head, C, HW]
-        # attn = q @ k^T -> [B, head, C, C]
-        attn = (q @ k.transpose(-2, -1)) * self.temperature
+        # Channel-wise attention: (C, HW) @ (HW, C) -> (C, C)
+        attn = (q @ k.transpose(-2, -1)) * self.temperature  # [B, head, C, C]
         attn = attn.softmax(dim=-1)
 
-        # apply attention to v: [B, head, C, C] @ [B, head, C, HW] -> [B, head, C, HW]
-        out = attn @ v
+        out = attn @ v  # [B, head, C, HW]
         out = rearrange(out, 'b head c (h w) -> b (head c) h w', head=self.num_heads, h=h, w=w)
 
         out = self.project_out(out)
         return out
 
 
+# ========================== MultiAttentionBlock (可指定注意力类型) ==========================
 class MultiAttentionBlock(torch.nn.Module):
-    def __init__(self, dim, num_heads, LayerNorm_type, ffn_expansion_factor, bias, is_DA):
+    def __init__(self, dim, num_heads, LayerNorm_type, ffn_expansion_factor, bias, is_DA,
+                 attn_class=Attention):   # 默认使用原始交叉注意力，保持 Net_D 兼容
         super(MultiAttentionBlock, self).__init__()
         self.norm1 = LayerNorm(dim, LayerNorm_type)
-        self.co_attn = Attention(dim, num_heads, bias)
+        self.co_attn = attn_class(dim, num_heads, bias)
         self.norm2 = LayerNorm(dim, LayerNorm_type)
         self.ffn1 = FeedForward(dim, ffn_expansion_factor, bias)
         if is_DA:
             self.norm3 = LayerNorm(dim, LayerNorm_type)
-            self.da_attn = Attention(dim, num_heads, bias)
+            self.da_attn = attn_class(dim, num_heads, bias)
             self.norm4 = LayerNorm(dim, LayerNorm_type)
             self.ffn2 = FeedForward(dim, ffn_expansion_factor, bias)
 
     def forward(self, Fw, F0_c, Kd):
         Fw = Fw + self.co_attn(self.norm1(Fw), F0_c)
         Fw = Fw + self.ffn1(self.norm2(Fw))
-        if Kd is not None:
+        if hasattr(self, 'da_attn') and Kd is not None:
             Fw = Fw + self.da_attn(self.norm3(Fw), Kd)
             Fw = Fw + self.ffn2(self.norm4(Fw))
         return Fw
 
 
+# ========================== FRMA (可指定注意力类型) ==========================
 class FRMA(torch.nn.Module):
     def __init__(self, dim, num_seq, growth_rate, num_dense_layer, num_flow, num_multi_attn, num_heads,
-                 LayerNorm_type, ffn_expansion_factor, bias, is_DA=False, is_first_f=False, is_first_Fw=False):
+                 LayerNorm_type, ffn_expansion_factor, bias, is_DA=False, is_first_f=False, is_first_Fw=False,
+                 attn_class=Attention):   # 默认原始注意力
         super(FRMA, self).__init__()
         self.rdb = RDB(dim, growth_rate, num_dense_layer, bias)
         self.rdb_KD = RDB(dim, growth_rate, num_dense_layer, bias) if is_DA else None
@@ -384,8 +407,8 @@ class FRMA(torch.nn.Module):
             nn.LeakyReLU(negative_slope=0.2, inplace=True),
             nn.Conv3d(3 * num_flow, 3 * num_flow, kernel_size=[1, 3, 3], padding=[0, 1, 1], stride=1, bias=bias))
         self.multi_attn_block = nn.ModuleList(
-            [MultiAttentionBlock(dim, num_heads, LayerNorm_type, ffn_expansion_factor, bias, is_DA) for _ in
-             range(num_multi_attn)])
+            [MultiAttentionBlock(dim, num_heads, LayerNorm_type, ffn_expansion_factor, bias, is_DA,
+                                 attn_class=attn_class) for _ in range(num_multi_attn)])
 
     def forward(self, F, Fw, f, F0_c, KD=None):
         B, C, T, H, W = F.shape
@@ -410,6 +433,7 @@ class FRMA(torch.nn.Module):
         return F, Fw, f
 
 
+# ========================== Net_D (完全保持不变，使用原始注意力) ==========================
 class Net_D(torch.nn.Module):
     def __init__(self, config):
         super(Net_D, self).__init__()
@@ -435,8 +459,10 @@ class Net_D(torch.nn.Module):
             RRDB(dim=dim, num_RDB=num_RDB, growth_rate=growth_rate, num_dense_layer=num_dense_layer, bias=config.bias))
         self.FRMA_blocks = nn.ModuleList(
             [FRMA(dim, num_seq, growth_rate, num_dense_layer, num_flow, num_transformer_block, num_heads,
-                  LayerNorm_type, ffn_expansion_factor, bias, is_DA=False, is_first_f=True if i == 0 else False,
-                  is_first_Fw=True if i == 0 else False) for i in range(num_FRMA)])
+                  LayerNorm_type, ffn_expansion_factor, bias, is_DA=False,
+                  is_first_f=True if i == 0 else False,
+                  is_first_Fw=True if i == 0 else False,
+                  attn_class=Attention) for i in range(num_FRMA)])   # 显式使用原始 Attention
         self.f_conv = nn.Sequential(
             nn.Conv3d(3 * num_flow, 3 * num_flow, kernel_size=[1, 3, 3], padding=[0, 1, 1], stride=1, bias=bias),
             nn.LeakyReLU(negative_slope=0.2, inplace=True),
@@ -466,6 +492,7 @@ class Net_D(torch.nn.Module):
         return F, KD, f_Y, f, anchor
 
 
+# ========================== Net_R (使用 Restormer 风格注意力) ==========================
 class Net_R(torch.nn.Module):
     def __init__(self, config):
         super(Net_R, self).__init__()
@@ -474,21 +501,10 @@ class Net_R(torch.nn.Module):
         num_seq = config.num_seq
         scale = config.scale
 
-        # --- 配置權重 (可學習) ---
-        # 将 base_alpha/base_beta/blind_res_scale 注册为可训练参数。
-        # 使用可逆映射保证数值约束：
-        #  - alpha, beta -> sigmoid(param) 映射到 (0,1)
-        #  - blind_res_scale -> softplus(param) 保证为正
+        # --- 可学习参数 ---
         self.base_alpha_param = nn.Parameter(torch.tensor(float(getattr(config, 'base_alpha', 0.8)), dtype=torch.float32))
         self.base_beta_param = nn.Parameter(torch.tensor(float(getattr(config, 'base_beta', 0.2)), dtype=torch.float32))
-        # store initial scale param; use softplus on this param in forward to ensure > 0
         self.blind_res_scale_param = nn.Parameter(torch.tensor(float(getattr(config, 'blind_res_scale', 1.20)), dtype=torch.float32))
-        # --- 盲元损失权重（可学习） ---
-        # restoration_loss_weight: non-blind region (final output outside blind) 的权重初值
-        # blind_restore_loss_weight: final output 在盲元区域的权重初值
-        # blind_res_loss_weight: blind residual 分支的权重初值
-        # restoration_loss_weight: non-blind region loss weight is controlled by config (fixed),
-        # not a learnable parameter to avoid the optimizer disabling non-blind protection.
         self.blind_restore_loss_weight_param = nn.Parameter(torch.tensor(float(getattr(config, 'blind_restore_loss_weight', 0.6)), dtype=torch.float32))
         self.blind_res_loss_weight_param = nn.Parameter(torch.tensor(float(getattr(config, 'blind_res_loss_weight', 2.0)), dtype=torch.float32))
 
@@ -510,10 +526,11 @@ class Net_R(torch.nn.Module):
             nn.LeakyReLU(negative_slope=0.2, inplace=True),
             RRDB(dim=dim, num_RDB=num_RDB, growth_rate=growth_rate, num_dense_layer=num_dense_layer, bias=config.bias)
         )
+        # 这里使用 RestormerAttention
         self.FRMA_blocks = nn.ModuleList([FRMA(dim, num_seq, growth_rate, num_dense_layer, num_flow,
                                                num_transformer_block, num_heads, LayerNorm_type, ffn_expansion_factor,
-                                               bias, is_DA=True, is_first_Fw=True if i == 0 else False) for i in
-                                          range(num_FRMA)])
+                                               bias, is_DA=True, is_first_Fw=True if i == 0 else False,
+                                               attn_class=RestormerAttention) for i in range(num_FRMA)])
         self.f_conv1 = nn.Sequential(
             nn.Conv3d(3 * num_flow, 3 * num_flow, kernel_size=[1, 3, 3], padding=[0, 1, 1], stride=1, bias=bias),
             nn.LeakyReLU(0.2, True),
@@ -531,7 +548,6 @@ class Net_R(torch.nn.Module):
         self.blind_gate_conv = nn.Conv2d(dim, 1, kernel_size=3, padding=1, stride=1, bias=bias)
         self.blind_gate_act = nn.Sigmoid()
 
-        # blind_res_scale is now represented by a learnable parameter `blind_res_scale_param` -> remove redundant cfg copy
         self.blind_infer_threshold = float(getattr(config, 'blind_infer_threshold', 0.10))
 
         self.r_conv = nn.Sequential(
@@ -565,11 +581,11 @@ class Net_R(torch.nn.Module):
         for blk in self.FRMA_blocks:
             F, Fw, f = blk(F, Fw, f, F0_c, KD)
 
-        # 1. 自身重構分支 (Res)
+        # 1. 自身重构分支 (Res)
         res_feat = self.relu(self.res_conv1(Fw))
         res = self.res_conv2(self.upsample(res_feat))
 
-        # 2. 鄰幀補償分支 (DUF)
+        # 2. 邻帧补偿分支 (DUF)
         KR = rearrange(Fw, 'b (c t) h w -> b c t h w', t=T)
         KR = self.r_conv(KR)
         f_X_initial = self.f_conv2(f)
@@ -579,18 +595,15 @@ class Net_R(torch.nn.Module):
         _, warped_X = self.bwarp(x, f_X_final)
         duf_output = self.duf(warped_X, KR)
 
-        # 3. 盲元預測與掩碼
+        # 3. 盲元预测与掩码
         blind_feat = self.relu(self.blind_res_conv1(Fw))
-        # compute raw blind residual (scale applied below using a learnable positive param)
         raw_blind_res = self.blind_res_conv2(blind_feat)
         blind_gate = self.blind_gate_act(self.blind_gate_conv(blind_feat))
 
-        # Map learnable params to constrained ranges and place on same device as features
         base_alpha = torch.sigmoid(self.base_alpha_param).to(Fw.device)
         base_beta = torch.sigmoid(self.base_beta_param).to(Fw.device)
         blind_res_scale = torch.nn.functional.softplus(self.blind_res_scale_param).to(Fw.device)
 
-        # scaled blind residual
         blind_res = raw_blind_res * blind_res_scale
 
         if blind_mask is None:
@@ -602,30 +615,17 @@ class Net_R(torch.nn.Module):
         if blind_mask.shape[-2:] != duf_output.shape[-2:]:
             blind_mask = F.interpolate(blind_mask, size=duf_output.shape[-2:], mode='nearest')
 
-        # final_blind_mask 結合了物理壞點位置和對齊置信度
         final_blind_mask = blind_mask * blind_gate
 
-        # ================================================================
-        # 核心改進：局部比例融合邏輯
-        # ================================================================
-        # 1. 計算盲元區專用的混合內容:
-        #    α * 邻帧补偿(duf) + β * 自身重构(res) + blind_res_scale * blind_res
-        # Note: base_alpha/base_beta are from sigmoid-mapped learnable params,
-        # and blind_res contribution is controlled by blind_res_scale (softplus-mapped param).
         blind_area_fill = (base_alpha * duf_output) + (base_beta * res) + blind_res
-
-        # 2. 局部替換邏輯：
-        # 非盲元區 (Mask=0): 直接使用 res (保證背景細節不動)
-        # 盲元區 (Mask=1): 使用融合後的 blind_area_fill
         output = (1.0 - final_blind_mask) * res + final_blind_mask * blind_area_fill
-        # ================================================================
 
-        base_output = duf_output + res  # 僅供監控
+        base_output = duf_output + res  # 仅供监控
         anchor = self.a_conv(F)
-        # 返回额外的 res 与 duf_output，便于验证阶段在外部对部分样本做羽化比较
         return output, warped_X, anchor, blind_res, blind_gate, final_blind_mask, base_output, res, duf_output
 
 
+# ========================== 总模型 ==========================
 class FMANet(torch.nn.Module):
     def __init__(self, config):
         super(FMANet, self).__init__()
@@ -660,7 +660,6 @@ class FMANet(torch.nn.Module):
             result_dict['blind_gate'] = blind_gate
             result_dict['blind_mask'] = blind_mask_used
             result_dict['base_output'] = base_output
-            # expose internal branches for optional evaluation/post-processing (e.g. selective feathering)
             result_dict['res'] = res
             result_dict['duf_output'] = duf_output
             return result_dict
