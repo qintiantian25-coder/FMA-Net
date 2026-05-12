@@ -114,6 +114,31 @@ class BlindPixelDataset(Dataset):
         if self.mode == 'train':
             t, h, w = blur_seq.shape
             th, tw = self.patch_size, self.patch_size
+
+            # If image is smaller than required patch, pad (reflect) to avoid negative ranges
+            pad_h = max(0, th - h)
+            pad_w = max(0, tw - w)
+            if pad_h > 0 or pad_w > 0:
+                pad_top = pad_h // 2
+                pad_bottom = pad_h - pad_top
+                pad_left = pad_w // 2
+                pad_right = pad_w - pad_left
+
+                def pad_stack(arr, is_flow=False):
+                    # arr shape: [T, H, W] for images, [T, H, W, C] for flow
+                    if is_flow:
+                        return np.pad(arr, ((0, 0), (pad_top, pad_bottom), (pad_left, pad_right), (0, 0)), mode='reflect')
+                    else:
+                        return np.pad(arr, ((0, 0), (pad_top, pad_bottom), (pad_left, pad_right)), mode='reflect')
+
+                blur_seq = pad_stack(blur_seq, is_flow=False)
+                sharp_seq = pad_stack(sharp_seq, is_flow=False)
+                flow_tensor = pad_stack(flow_tensor, is_flow=True)
+
+                # update sizes
+                t, h, w = blur_seq.shape
+
+            # now safe to sample
             x1 = random.randint(0, w - tw)
             y1 = random.randint(0, h - th)
 

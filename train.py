@@ -696,10 +696,14 @@ class Trainer:
 
         gt_root = os.path.join(self.config.dataset_path, 'test_sharp')
         gt_finder = {}
+        gt_rel_finder = {}
         for root, _, files in os.walk(gt_root):
             for f in files:
                 if f.lower().endswith('.png'):
-                    gt_finder[f] = os.path.join(root, f)
+                    p = os.path.join(root, f)
+                    gt_finder[f] = p
+                    rel = os.path.relpath(p, gt_root).replace('\\', '/')
+                    gt_rel_finder[rel] = p
 
         print(f"===> 开始精准推理与可视化...")
 
@@ -708,21 +712,29 @@ class Trainer:
                 # 1. 确定中心帧索引
                 t_idx = lr_blur_seq.shape[2] // 2
 
-                # 2. 核心修正：适配多种 path 返回结构 (解决 IndexError)
+                # 2. 兼容不同 DataLoader 回传结构，并保留相对子路径用于分目录保存。
+                relative_name = None
                 if isinstance(relative_path, (list, tuple)) and len(relative_path) == 1:
-                    # 情况 A: 只有一帧名字 ['001\\3.png']
-                    current_frame_name = os.path.basename(relative_path[0])
+                    # 情况 A: batch_size=1 时常见，形如 ['001\\3.png']
+                    relative_name = relative_path[0]
                 elif isinstance(relative_path, (list, tuple)) and len(relative_path) > t_idx:
                     # 情况 B: 有完整的序列名字 ['1.png', '2.png', '3.png'...]
                     target_item = relative_path[t_idx]
-                    current_frame_name = os.path.basename(
-                        target_item[0] if isinstance(target_item, (list, tuple)) else target_item)
+                    relative_name = target_item[0] if isinstance(target_item, (list, tuple)) else target_item
                 else:
                     # 兜底
-                    current_frame_name = os.path.basename(relative_path[0])
+                    if isinstance(relative_path, (list, tuple)):
+                        relative_name = relative_path[0]
+                    else:
+                        relative_name = relative_path
+
+                relative_name = str(relative_name).replace('\\', '/')
+                current_frame_name = os.path.basename(relative_name)
 
                 if not current_frame_name.lower().endswith('.png'):
                     current_frame_name += '.png'
+                if not relative_name.lower().endswith('.png'):
+                    relative_name += '.png'
 
                 # 3. 推理核心
                 lr_blur_seq = lr_blur_seq.cuda()
@@ -735,7 +747,9 @@ class Trainer:
 
                 # 4. 提取对应的输入中心帧和真值进行对比
                 input_blind = lr_blur_seq[:, :, t_idx, :, :]
-                gt_path = gt_finder.get(current_frame_name)
+                gt_path = gt_rel_finder.get(relative_name)
+                if gt_path is None:
+                    gt_path = gt_finder.get(current_frame_name)
 
                 if gt_path:
                     gt_img = cv2.imread(gt_path, cv2.IMREAD_GRAYSCALE)
@@ -753,10 +767,16 @@ class Trainer:
                     comparison = torch.cat([input_blind, output, gt_tensor], dim=3)
 
                     import torchvision
-                    torchvision.utils.save_image(comparison, os.path.join(save_triple, f"triple_{current_frame_name}"))
-                    torchvision.utils.save_image(output, os.path.join(save_pure, current_frame_name))
+                    rel_dir = os.path.dirname(relative_name)
+                    triple_dir = os.path.join(save_triple, rel_dir) if rel_dir else save_triple
+                    pure_dir = os.path.join(save_pure, rel_dir) if rel_dir else save_pure
+                    os.makedirs(triple_dir, exist_ok=True)
+                    os.makedirs(pure_dir, exist_ok=True)
+
+                    torchvision.utils.save_image(comparison, os.path.join(triple_dir, f"triple_{current_frame_name}"))
+                    torchvision.utils.save_image(output, os.path.join(pure_dir, current_frame_name))
                 else:
-                    print(f"[!] 警告: 找不到 {current_frame_name} 的 GT")
+                    print(f"[!] 警告: 找不到 {relative_name} 的 GT")
 
                 if (idx + 1) % 10 == 0:
                     print(f"进度: {idx + 1}/{len(dataloader)} | 正在保存: {current_frame_name}")
@@ -786,30 +806,114 @@ class Trainer:
             arr = np.unique(np.array(coords, dtype=np.int32), axis=0)
             return arr
 
+        def load_flash_map(csv_path):
+            """
+            读取闪元 CSV，返回一个字典: {frame_name: [(x,y), ...], ...}
+            兼容文件缺失或格式不完整的情况，坐标去重。
+            期望的 CSV header: ['frame_name','x','y', ...]
+            """
+            if not os.path.exists(csv_path):
+                return {}
+            flash_map = {}
+            with open(csv_path, 'r', encoding='utf-8-sig', newline='') as f:
+                reader = csv.DictReader(f)
+                if reader.fieldnames is None or 'frame_name' not in reader.fieldnames or 'x' not in reader.fieldnames or 'y' not in reader.fieldnames:
+                    return {}
+                for row in reader:
+                    try:
+                        fname = os.path.basename(row['frame_name'])
+                        x = int(float(row['x']))
+                        y = int(float(row['y']))
+                    except Exception:
+                        continue
+                    flash_map.setdefault(fname, set()).add((x, y))
+
+            # convert sets to lists for deterministic iteration
+            for k in list(flash_map.keys()):
+                flash_map[k] = list(flash_map[k])
+            return flash_map
+
         def natural_sort_key(s):
             return [int(text) if text.isdigit() else text.lower() for text in re.split('([0-9]+)', s)]
 
-        out_imgs = sorted([f for f in os.listdir(output_dir) if f.endswith('.png')], key=natural_sort_key)
-        gt_map = {}
+        # 递归扫描输出，支持 output_dir 下按子文件夹保存测试结果。
+        out_records = []
+        for root, _, files in os.walk(output_dir):
+            for f in files:
+                if not f.endswith('.png'):
+                    continue
+                out_path = os.path.join(root, f)
+                rel_path = os.path.relpath(out_path, output_dir).replace('\\', '/')
+                seq = rel_path.split('/')[0] if '/' in rel_path else ''
+                out_records.append({
+                    'out_path': out_path,
+                    'img_name': f,
+                    'rel_path': rel_path,
+                    'seq': seq,
+                })
+        out_records = sorted(out_records, key=lambda r: natural_sort_key(r['rel_path']))
+
+        # GT 与输入图都支持相对路径与文件名两种匹配（优先相对路径，避免同名冲突）。
+        gt_rel_map, gt_name_map = {}, {}
         for root, _, files in os.walk(gt_dir):
             for f in files:
-                if f.endswith('.png'): gt_map[f] = os.path.join(root, f)
+                if not f.endswith('.png'):
+                    continue
+                p = os.path.join(root, f)
+                rel = os.path.relpath(p, gt_dir).replace('\\', '/')
+                gt_rel_map[rel] = p
+                gt_name_map.setdefault(f, []).append(p)
 
-        # 盲元专项评估输入：仿真时保存的坐标文件 + 输入盲图（用于计算恢复增益）。
-        test_mask_csv = getattr(
+        input_root = os.path.join(self.config.dataset_path, 'test_blur')
+        input_rel_map, input_name_map = {}, {}
+        if os.path.exists(input_root):
+            for root, _, files in os.walk(input_root):
+                for f in files:
+                    if not f.endswith('.png'):
+                        continue
+                    p = os.path.join(root, f)
+                    rel = os.path.relpath(p, input_root).replace('\\', '/')
+                    input_rel_map[rel] = p
+                    input_name_map.setdefault(f, []).append(p)
+
+        # 盲元坐标按测试子文件夹缓存加载：test_mask/<seq>/blind_pixel_coords.csv 与 flash_pixel_coords.csv
+        mask_root = os.path.join(self.config.dataset_path, 'test_mask')
+        legacy_mask_csv = getattr(
             self.config,
             'test_mask_csv',
             os.path.join(self.config.dataset_path, 'test_mask', '001', 'blind_pixel_coords.csv')
         )
-        blind_coords = load_blind_coords(test_mask_csv)
+        seq_mask_cache = {}
 
-        input_root = os.path.join(self.config.dataset_path, 'test_blur')
-        input_map = {}
-        if os.path.exists(input_root):
-            for root, _, files in os.walk(input_root):
-                for f in files:
-                    if f.endswith('.png'):
-                        input_map[f] = os.path.join(root, f)
+        def resolve_seq_masks(seq_name):
+            key = seq_name or '__root__'
+            if key in seq_mask_cache:
+                return seq_mask_cache[key]
+
+            if seq_name:
+                blind_csv = os.path.join(mask_root, seq_name, 'blind_pixel_coords.csv')
+                flash_csv = os.path.join(mask_root, seq_name, 'flash_pixel_coords.csv')
+            else:
+                blind_csv = legacy_mask_csv
+                flash_csv = os.path.join(os.path.dirname(legacy_mask_csv), 'flash_pixel_coords.csv')
+
+            seq_mask_cache[key] = {
+                'blind_csv': blind_csv,
+                'blind_coords': load_blind_coords(blind_csv),
+                'flash_map': load_flash_map(flash_csv)
+            }
+            return seq_mask_cache[key]
+
+        def resolve_by_name(name_map, img_name, seq_hint):
+            candidates = name_map.get(img_name, [])
+            if len(candidates) == 1:
+                return candidates[0]
+            if len(candidates) > 1 and seq_hint:
+                for c in candidates:
+                    rel = os.path.relpath(c, gt_dir if name_map is gt_name_map else input_root).replace('\\', '/')
+                    if rel.split('/')[0] == seq_hint:
+                        return c
+            return None
 
         blind_abs_sum = 0.0
         blind_sq_sum = 0.0
@@ -818,23 +922,49 @@ class Trainer:
         blind_pix_sum = 0
         per_image_logs = []
 
-        print(f"===> 开始定量打分，准备比对 {len(out_imgs)} 张图片...")
-        for img_name in out_imgs:
-            out_path = os.path.join(output_dir, img_name)
-            gt_path = gt_map.get(img_name)
+        # 分子文件夹累计，用于输出独立 CSV 与分组汇总。
+        seq_logs = {}
+        seq_stats = {}
+
+        print(f"===> 开始定量打分，准备比对 {len(out_records)} 张图片...")
+        for rec in out_records:
+            img_name = rec['img_name']
+            rel_name = rec['rel_path']
+            out_path = rec['out_path']
+
+            # 1) 优先按相对路径匹配 GT；2) 再按文件名匹配（兼容旧输出结构）。
+            gt_path = gt_rel_map.get(rel_name)
+            if gt_path is None and rec['seq']:
+                gt_path = gt_rel_map.get(f"{rec['seq']}/{img_name}")
+            if gt_path is None:
+                gt_path = resolve_by_name(gt_name_map, img_name, rec['seq'])
+
             if gt_path and os.path.exists(out_path):
                 out_img = cv2.imread(out_path, cv2.IMREAD_GRAYSCALE)
                 gt_img = cv2.imread(gt_path, cv2.IMREAD_GRAYSCALE)
                 if gt_img is not None and out_img is not None:
                     if out_img.shape != gt_img.shape:
                         out_img = cv2.resize(out_img, (gt_img.shape[1], gt_img.shape[0]))
-                    report.update_metric(gt_img, out_img, img_name)
+                    report.update_metric(gt_img, out_img, rel_name)
                     full_psnr = float(report.total_rgb_psnr[-1])
                     full_ssim = float(report.total_ssim[-1])
 
+                    rel_gt = os.path.relpath(gt_path, gt_dir).replace('\\', '/')
+                    seq_name = rel_gt.split('/')[0] if '/' in rel_gt else (rec['seq'] or 'root')
+                    seq_logs.setdefault(seq_name, [])
+                    if seq_name not in seq_stats:
+                        seq_stats[seq_name] = {
+                            'blind_abs_sum': 0.0,
+                            'blind_sq_sum': 0.0,
+                            'blind_abs_in_sum': 0.0,
+                            'blind_sq_in_sum': 0.0,
+                            'blind_pix_sum': 0,
+                        }
+
                     # Always log full-frame quality so every test run has complete per-image records.
                     row = {
-                        'image': img_name,
+                        'image': rel_name,
+                        'seq': seq_name,
                         'psnr': full_psnr,
                         'ssim': full_ssim,
                         'blind_mae': None,
@@ -846,16 +976,36 @@ class Trainer:
                         'blind_count': 0
                     }
 
-                    # 盲元专项评估：仅在 CSV 指定坐标统计误差，直接对应你的仿真盲元位置。
+                    # 盲元专项评估：静态盲元 + 当前帧闪元并集（按子文件夹独立加载）。
+                    merged_coords = []
+                    h, w = gt_img.shape[:2]
+                    seq_mask = resolve_seq_masks(seq_name if seq_name != 'root' else '')
+                    blind_coords = seq_mask['blind_coords']
+                    flash_map = seq_mask['flash_map']
+
                     if blind_coords is not None:
-                        h, w = gt_img.shape[:2]
                         x = blind_coords[:, 0]
                         y = blind_coords[:, 1]
                         valid = (x >= 0) & (x < w) & (y >= 0) & (y < h)
                         if np.any(valid):
-                            x = x[valid]
-                            y = y[valid]
+                            xs = x[valid].tolist()
+                            ys = y[valid].tolist()
+                            merged_coords.extend(list(zip(xs, ys)))
 
+                    frame_flash = flash_map.get(img_name, []) if flash_map else []
+                    for (fx, fy) in frame_flash:
+                        if 0 <= fx < w and 0 <= fy < h:
+                            merged_coords.append((fx, fy))
+
+                    # 去重并验证坐标
+                    if len(merged_coords) > 0:
+                        coords_arr = np.unique(np.array(merged_coords, dtype=np.int32), axis=0)
+                        if coords_arr.size == 0:
+                            # 安全兜底
+                            pass
+                        else:
+                            x = coords_arr[:, 0]
+                            y = coords_arr[:, 1]
                             gt_vals = gt_img[y, x].astype(np.float64)
                             out_vals = out_img[y, x].astype(np.float64)
                             err = out_vals - gt_vals
@@ -866,9 +1016,16 @@ class Trainer:
                             blind_abs_sum += float(blind_abs.sum())
                             blind_sq_sum += float(blind_sq.sum())
                             blind_pix_sum += int(len(err))
+                            seq_stats[seq_name]['blind_abs_sum'] += float(blind_abs.sum())
+                            seq_stats[seq_name]['blind_sq_sum'] += float(blind_sq.sum())
+                            seq_stats[seq_name]['blind_pix_sum'] += int(len(err))
 
                             # 同时记录输入盲图误差，便于看“修复提升了多少”。
-                            in_path = input_map.get(img_name)
+                            in_path = input_rel_map.get(rel_name)
+                            if in_path is None and seq_name != 'root':
+                                in_path = input_rel_map.get(f"{seq_name}/{img_name}")
+                            if in_path is None:
+                                in_path = resolve_by_name(input_name_map, img_name, seq_name)
                             in_mae = None
                             if in_path and os.path.exists(in_path):
                                 in_img = cv2.imread(in_path, cv2.IMREAD_GRAYSCALE)
@@ -881,6 +1038,8 @@ class Trainer:
                                     in_sq = in_err ** 2
                                     blind_abs_in_sum += float(in_abs.sum())
                                     blind_sq_in_sum += float(in_sq.sum())
+                                    seq_stats[seq_name]['blind_abs_in_sum'] += float(in_abs.sum())
+                                    seq_stats[seq_name]['blind_sq_in_sum'] += float(in_sq.sum())
                                     in_mae = float(in_abs.mean())
 
                             row.update({
@@ -893,6 +1052,7 @@ class Trainer:
                             if in_mae is not None:
                                 row['blind_mae_gain_abs'] = in_mae - row['blind_mae']
                                 row['blind_mae_gain_pct'] = 100.0 * row['blind_mae_gain_abs'] / (in_mae + 1e-12)
+                    seq_logs[seq_name].append(row)
                     per_image_logs.append(row)
         report.print_final_result()
 
@@ -902,7 +1062,7 @@ class Trainer:
         save_blind_csv = os.path.join(save_blind_dir, 'test_blind_metrics.csv')
         if len(per_image_logs) > 0:
             keys = [
-                'image', 'psnr', 'ssim',
+                'image', 'seq', 'psnr', 'ssim',
                 'blind_mae', 'blind_rmse', 'blind_psnr',
                 'blind_mae_input', 'blind_mae_gain_abs', 'blind_mae_gain_pct', 'blind_count'
             ]
@@ -913,15 +1073,67 @@ class Trainer:
                     writer.writerow(row)
             print(f"Per-image test metrics saved to: {save_blind_csv}")
 
+            # 按测试子文件夹输出独立 CSV：test_blind_metrics_<seq>.csv
+            for seq_name in sorted(seq_logs.keys(), key=natural_sort_key):
+                seq_csv = os.path.join(save_blind_dir, f"test_blind_metrics_{seq_name}.csv")
+                with open(seq_csv, 'w', encoding='utf-8', newline='') as f:
+                    writer = csv.DictWriter(f, fieldnames=keys)
+                    writer.writeheader()
+                    for row in seq_logs[seq_name]:
+                        writer.writerow(row)
+                print(f"Per-seq metrics saved to: {seq_csv}")
+
+            # 额外输出每个子文件夹的汇总指标，便于横向对比。
+            summary_csv = os.path.join(save_blind_dir, 'test_blind_summary_by_seq.csv')
+            summary_keys = [
+                'seq', 'images', 'blind_count',
+                'blind_mae', 'blind_rmse', 'blind_psnr',
+                'input_blind_mae', 'input_blind_psnr',
+                'blind_mae_gain_abs', 'blind_mae_gain_pct'
+            ]
+            with open(summary_csv, 'w', encoding='utf-8', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=summary_keys)
+                writer.writeheader()
+                for seq_name in sorted(seq_logs.keys(), key=natural_sort_key):
+                    st = seq_stats.get(seq_name, {})
+                    pix = int(st.get('blind_pix_sum', 0))
+                    row = {
+                        'seq': seq_name,
+                        'images': len(seq_logs.get(seq_name, [])),
+                        'blind_count': pix,
+                        'blind_mae': None,
+                        'blind_rmse': None,
+                        'blind_psnr': None,
+                        'input_blind_mae': None,
+                        'input_blind_psnr': None,
+                        'blind_mae_gain_abs': None,
+                        'blind_mae_gain_pct': None,
+                    }
+                    if pix > 0:
+                        mae = st['blind_abs_sum'] / pix
+                        mse = st['blind_sq_sum'] / pix
+                        row['blind_mae'] = float(mae)
+                        row['blind_rmse'] = float(np.sqrt(mse))
+                        row['blind_psnr'] = float(10.0 * np.log10((255.0 * 255.0) / max(mse, 1e-12)))
+                        if st['blind_abs_in_sum'] > 0:
+                            in_mae = st['blind_abs_in_sum'] / pix
+                            in_mse = st['blind_sq_in_sum'] / pix
+                            row['input_blind_mae'] = float(in_mae)
+                            row['input_blind_psnr'] = float(10.0 * np.log10((255.0 * 255.0) / max(in_mse, 1e-12)))
+                            row['blind_mae_gain_abs'] = float(in_mae - mae)
+                            row['blind_mae_gain_pct'] = float(100.0 * row['blind_mae_gain_abs'] / (in_mae + 1e-12))
+                    writer.writerow(row)
+            print(f"Per-seq summary saved to: {summary_csv}")
+
         # 汇总输出盲元专项指标，便于不同模型横向比较。
-        if blind_coords is not None and blind_pix_sum > 0:
+        if blind_pix_sum > 0:
             blind_mae = blind_abs_sum / blind_pix_sum
             blind_mse = blind_sq_sum / blind_pix_sum
             blind_rmse = float(np.sqrt(blind_mse))
             blind_psnr = float(10.0 * np.log10((255.0 * 255.0) / max(blind_mse, 1e-12)))
 
             print("===> Blind-Pixel Focused Metrics")
-            print(f"BlindCoordsCSV: {test_mask_csv}")
+            print(f"MaskRoot: {mask_root}")
             print(f"BlindCount(total sampled): {blind_pix_sum}")
             print(f"Blind MAE: {blind_mae:.6f} | Blind RMSE: {blind_rmse:.6f} | Blind PSNR: {blind_psnr:.3f}")
 
