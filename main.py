@@ -89,9 +89,11 @@ def train(config):
             elif isinstance(val_result, (list, tuple)):
                 current_psnr = val_result[0]
                 current_blind_l1 = None
+                current_blind_psnr = None
             else:
                 current_psnr = val_result
                 current_blind_l1 = None
+                current_blind_psnr = None
 
             # Robust scalar conversion: accepts Python/NumPy numbers, tensors, lists, and arrays.
             # This prevents np.isinf/np.isnan from crashing when validate() returns non-scalar containers.
