@@ -205,7 +205,8 @@ def test(config):
     trainer.test_quantitative_result(
         gt_dir=gt_root,
         output_dir=output_root,
-        image_border=0
+        image_border=0,
+        write_split_csv=False
     )
 
 

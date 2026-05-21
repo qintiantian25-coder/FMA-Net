@@ -717,6 +717,8 @@ class Trainer:
                 image_border=0,
                 group_name=group_name if group_name else None,
                 csv_subdir=group_label,
+                write_split_csv=False,
+                write_summary_csv=False,
             )
 
         print(f"===> 开始精准推理与可视化...")
@@ -810,7 +812,8 @@ class Trainer:
 
     pass
 
-    def test_quantitative_result(self, gt_dir, output_dir, image_border, group_name=None, csv_subdir=None):
+    def test_quantitative_result(self, gt_dir, output_dir, image_border, group_name=None, csv_subdir=None,
+                                 write_split_csv=True, write_summary_csv=True):
         from utils import TestReport
         report = TestReport()
 
@@ -1105,7 +1108,7 @@ class Trainer:
             total_seq_logs[seq_name] = seq_logs
             total_seq_stats[seq_name] = seq_stats
 
-            if len(seq_logs) > 0:
+            if write_split_csv and len(seq_logs) > 0:
                 seq_label = seq_name or 'root'
                 seq_csv = os.path.join(save_blind_dir, f"test_blind_metrics_{seq_label}.csv")
                 with open(seq_csv, 'w', encoding='utf-8', newline='') as f:
@@ -1125,40 +1128,41 @@ class Trainer:
                     writer.writerow(row)
             print(f"Per-image test metrics saved to: {save_blind_csv}")
 
-            summary_csv = os.path.join(save_blind_dir, 'test_blind_summary_by_seq.csv')
-            with open(summary_csv, 'w', encoding='utf-8', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=summary_keys)
-                writer.writeheader()
-                for seq_name in sorted(total_seq_logs.keys(), key=natural_sort_key):
-                    st = total_seq_stats.get(seq_name, {})
-                    pix = int(st.get('blind_pix_sum', 0))
-                    row = {
-                        'seq': seq_name,
-                        'images': len(total_seq_logs.get(seq_name, [])),
-                        'blind_count': pix,
-                        'blind_mae': None,
-                        'blind_rmse': None,
-                        'blind_psnr': None,
-                        'input_blind_mae': None,
-                        'input_blind_psnr': None,
-                        'blind_mae_gain_abs': None,
-                        'blind_mae_gain_pct': None,
-                    }
-                    if pix > 0:
-                        mae = st['blind_abs_sum'] / pix
-                        mse = st['blind_sq_sum'] / pix
-                        row['blind_mae'] = float(mae)
-                        row['blind_rmse'] = float(np.sqrt(mse))
-                        row['blind_psnr'] = float(10.0 * np.log10((255.0 * 255.0) / max(mse, 1e-12)))
-                        if st['blind_abs_in_sum'] > 0:
-                            in_mae = st['blind_abs_in_sum'] / pix
-                            in_mse = st['blind_sq_in_sum'] / pix
-                            row['input_blind_mae'] = float(in_mae)
-                            row['input_blind_psnr'] = float(10.0 * np.log10((255.0 * 255.0) / max(in_mse, 1e-12)))
-                            row['blind_mae_gain_abs'] = float(in_mae - mae)
-                            row['blind_mae_gain_pct'] = float(100.0 * row['blind_mae_gain_abs'] / (in_mae + 1e-12))
-                    writer.writerow(row)
-            print(f"Per-seq summary saved to: {summary_csv}")
+            if write_summary_csv:
+                summary_csv = os.path.join(save_blind_dir, 'test_blind_summary_by_seq.csv')
+                with open(summary_csv, 'w', encoding='utf-8', newline='') as f:
+                    writer = csv.DictWriter(f, fieldnames=summary_keys)
+                    writer.writeheader()
+                    for seq_name in sorted(total_seq_logs.keys(), key=natural_sort_key):
+                        st = total_seq_stats.get(seq_name, {})
+                        pix = int(st.get('blind_pix_sum', 0))
+                        row = {
+                            'seq': seq_name,
+                            'images': len(total_seq_logs.get(seq_name, [])),
+                            'blind_count': pix,
+                            'blind_mae': None,
+                            'blind_rmse': None,
+                            'blind_psnr': None,
+                            'input_blind_mae': None,
+                            'input_blind_psnr': None,
+                            'blind_mae_gain_abs': None,
+                            'blind_mae_gain_pct': None,
+                        }
+                        if pix > 0:
+                            mae = st['blind_abs_sum'] / pix
+                            mse = st['blind_sq_sum'] / pix
+                            row['blind_mae'] = float(mae)
+                            row['blind_rmse'] = float(np.sqrt(mse))
+                            row['blind_psnr'] = float(10.0 * np.log10((255.0 * 255.0) / max(mse, 1e-12)))
+                            if st['blind_abs_in_sum'] > 0:
+                                in_mae = st['blind_abs_in_sum'] / pix
+                                in_mse = st['blind_sq_in_sum'] / pix
+                                row['input_blind_mae'] = float(in_mae)
+                                row['input_blind_psnr'] = float(10.0 * np.log10((255.0 * 255.0) / max(in_mse, 1e-12)))
+                                row['blind_mae_gain_abs'] = float(in_mae - mae)
+                                row['blind_mae_gain_pct'] = float(100.0 * row['blind_mae_gain_abs'] / (in_mae + 1e-12))
+                        writer.writerow(row)
+                print(f"Per-seq summary saved to: {summary_csv}")
 
         if total_blind_pix_sum > 0:
             blind_mae = total_blind_abs_sum / total_blind_pix_sum
