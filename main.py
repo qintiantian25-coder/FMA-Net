@@ -2,6 +2,7 @@ import os
 import torch
 import random
 import argparse
+import re
 import numpy as np
 import numbers
 
@@ -15,6 +16,10 @@ from config import Config
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def natural_sort_key(s):
+    return [int(text) if text.isdigit() else text.lower() for text in re.split('([0-9]+)', s)]
 
 
 def train(config):
@@ -195,12 +200,25 @@ def test(config):
     output_root = os.path.join(config.save_dir, 'test') # 对应 Trainer.test 里的保存位置
 
     print("===> Starting Quantitative Evaluation...")
-    # 注意：如果你的 test_sharp 里没有子文件夹（全是图），
-    # 记得配合我之前建议你修改的那个“扁平化”版本的 test_quantitative_result
+    if os.path.isdir(output_root):
+        group_dirs = [d for d in os.listdir(output_root) if os.path.isdir(os.path.join(output_root, d))]
+        group_dirs = sorted(group_dirs, key=natural_sort_key)
+        for group_name in group_dirs:
+            group_output_dir = os.path.join(output_root, group_name)
+            print(f"===> Starting Quantitative Evaluation for group {group_name}...")
+            trainer.test_quantitative_result(
+                gt_dir=gt_root,
+                output_dir=group_output_dir,
+                image_border=0,
+                group_name=group_name,
+                csv_subdir=group_name,
+            )
+
+    # 最后再做一次全量汇总，保证总 csv 和总 blind summary 存在。
     trainer.test_quantitative_result(
         gt_dir=gt_root,
         output_dir=output_root,
-        image_border=0  # 盲元修复通常看全图，如果不需要裁边可以设为 0
+        image_border=0
     )
 
 

@@ -783,7 +783,7 @@ class Trainer:
 
     pass
 
-    def test_quantitative_result(self, gt_dir, output_dir, image_border):
+    def test_quantitative_result(self, gt_dir, output_dir, image_border, group_name=None, csv_subdir=None):
         from utils import TestReport
         report = TestReport()
 
@@ -844,7 +844,7 @@ class Trainer:
                     continue
                 out_path = os.path.join(root, f)
                 rel_path = os.path.relpath(out_path, output_dir).replace('\\', '/')
-                seq = rel_path.split('/')[0] if '/' in rel_path else ''
+                seq = rel_path.split('/')[0] if '/' in rel_path else (group_name or '')
                 out_records.append({
                     'out_path': out_path,
                     'img_name': f,
@@ -919,7 +919,7 @@ class Trainer:
                         return c
             return None
 
-        save_blind_dir = os.path.join(self.config.save_dir, 'blind_eval')
+        save_blind_dir = os.path.join(self.config.save_dir, 'blind_eval', csv_subdir) if csv_subdir else os.path.join(self.config.save_dir, 'blind_eval')
         os.makedirs(save_blind_dir, exist_ok=True)
         total_per_image_logs = []
         total_seq_logs = {}
