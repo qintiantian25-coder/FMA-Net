@@ -853,6 +853,10 @@ class Trainer:
                 })
         out_records = sorted(out_records, key=lambda r: natural_sort_key(r['rel_path']))
 
+        seq_records = {}
+        for rec in out_records:
+            seq_records.setdefault(rec['seq'] or 'root', []).append(rec)
+
         # GT 与输入图都支持相对路径与文件名两种匹配（优先相对路径，避免同名冲突）。
         gt_rel_map, gt_name_map = {}, {}
         for root, _, files in os.walk(gt_dir):
@@ -915,191 +919,195 @@ class Trainer:
                         return c
             return None
 
-        blind_abs_sum = 0.0
-        blind_sq_sum = 0.0
-        blind_abs_in_sum = 0.0
-        blind_sq_in_sum = 0.0
-        blind_pix_sum = 0
-        per_image_logs = []
-
-        # 分子文件夹累计，用于输出独立 CSV 与分组汇总。
-        seq_logs = {}
-        seq_stats = {}
-
-        print(f"===> 开始定量打分，准备比对 {len(out_records)} 张图片...")
-        for rec in out_records:
-            img_name = rec['img_name']
-            rel_name = rec['rel_path']
-            out_path = rec['out_path']
-
-            # 1) 优先按相对路径匹配 GT；2) 再按文件名匹配（兼容旧输出结构）。
-            gt_path = gt_rel_map.get(rel_name)
-            if gt_path is None and rec['seq']:
-                gt_path = gt_rel_map.get(f"{rec['seq']}/{img_name}")
-            if gt_path is None:
-                gt_path = resolve_by_name(gt_name_map, img_name, rec['seq'])
-
-            if gt_path and os.path.exists(out_path):
-                out_img = cv2.imread(out_path, cv2.IMREAD_GRAYSCALE)
-                gt_img = cv2.imread(gt_path, cv2.IMREAD_GRAYSCALE)
-                if gt_img is not None and out_img is not None:
-                    if out_img.shape != gt_img.shape:
-                        out_img = cv2.resize(out_img, (gt_img.shape[1], gt_img.shape[0]))
-                    report.update_metric(gt_img, out_img, rel_name)
-                    full_psnr = float(report.total_rgb_psnr[-1])
-                    full_ssim = float(report.total_ssim[-1])
-
-                    rel_gt = os.path.relpath(gt_path, gt_dir).replace('\\', '/')
-                    seq_name = rel_gt.split('/')[0] if '/' in rel_gt else (rec['seq'] or 'root')
-                    seq_logs.setdefault(seq_name, [])
-                    if seq_name not in seq_stats:
-                        seq_stats[seq_name] = {
-                            'blind_abs_sum': 0.0,
-                            'blind_sq_sum': 0.0,
-                            'blind_abs_in_sum': 0.0,
-                            'blind_sq_in_sum': 0.0,
-                            'blind_pix_sum': 0,
-                        }
-
-                    # Always log full-frame quality so every test run has complete per-image records.
-                    row = {
-                        'image': rel_name,
-                        'seq': seq_name,
-                        'psnr': full_psnr,
-                        'ssim': full_ssim,
-                        'blind_mae': None,
-                        'blind_rmse': None,
-                        'blind_psnr': None,
-                        'blind_mae_input': None,
-                        'blind_mae_gain_abs': None,
-                        'blind_mae_gain_pct': None,
-                        'blind_count': 0
-                    }
-
-                    # 盲元专项评估：静态盲元 + 当前帧闪元并集（按子文件夹独立加载）。
-                    merged_coords = []
-                    h, w = gt_img.shape[:2]
-                    seq_mask = resolve_seq_masks(seq_name if seq_name != 'root' else '')
-                    blind_coords = seq_mask['blind_coords']
-                    flash_map = seq_mask['flash_map']
-
-                    if blind_coords is not None:
-                        x = blind_coords[:, 0]
-                        y = blind_coords[:, 1]
-                        valid = (x >= 0) & (x < w) & (y >= 0) & (y < h)
-                        if np.any(valid):
-                            xs = x[valid].tolist()
-                            ys = y[valid].tolist()
-                            merged_coords.extend(list(zip(xs, ys)))
-
-                    frame_flash = flash_map.get(img_name, []) if flash_map else []
-                    for (fx, fy) in frame_flash:
-                        if 0 <= fx < w and 0 <= fy < h:
-                            merged_coords.append((fx, fy))
-
-                    # 去重并验证坐标
-                    if len(merged_coords) > 0:
-                        coords_arr = np.unique(np.array(merged_coords, dtype=np.int32), axis=0)
-                        if coords_arr.size == 0:
-                            # 安全兜底
-                            pass
-                        else:
-                            x = coords_arr[:, 0]
-                            y = coords_arr[:, 1]
-                            gt_vals = gt_img[y, x].astype(np.float64)
-                            out_vals = out_img[y, x].astype(np.float64)
-                            err = out_vals - gt_vals
-
-                            blind_abs = np.abs(err)
-                            blind_sq = err ** 2
-
-                            blind_abs_sum += float(blind_abs.sum())
-                            blind_sq_sum += float(blind_sq.sum())
-                            blind_pix_sum += int(len(err))
-                            seq_stats[seq_name]['blind_abs_sum'] += float(blind_abs.sum())
-                            seq_stats[seq_name]['blind_sq_sum'] += float(blind_sq.sum())
-                            seq_stats[seq_name]['blind_pix_sum'] += int(len(err))
-
-                            # 同时记录输入盲图误差，便于看“修复提升了多少”。
-                            in_path = input_rel_map.get(rel_name)
-                            if in_path is None and seq_name != 'root':
-                                in_path = input_rel_map.get(f"{seq_name}/{img_name}")
-                            if in_path is None:
-                                in_path = resolve_by_name(input_name_map, img_name, seq_name)
-                            in_mae = None
-                            if in_path and os.path.exists(in_path):
-                                in_img = cv2.imread(in_path, cv2.IMREAD_GRAYSCALE)
-                                if in_img is not None:
-                                    if in_img.shape != gt_img.shape:
-                                        in_img = cv2.resize(in_img, (gt_img.shape[1], gt_img.shape[0]))
-                                    in_vals = in_img[y, x].astype(np.float64)
-                                    in_err = in_vals - gt_vals
-                                    in_abs = np.abs(in_err)
-                                    in_sq = in_err ** 2
-                                    blind_abs_in_sum += float(in_abs.sum())
-                                    blind_sq_in_sum += float(in_sq.sum())
-                                    seq_stats[seq_name]['blind_abs_in_sum'] += float(in_abs.sum())
-                                    seq_stats[seq_name]['blind_sq_in_sum'] += float(in_sq.sum())
-                                    in_mae = float(in_abs.mean())
-
-                            row.update({
-                                'blind_mae': float(blind_abs.mean()),
-                                'blind_rmse': float(np.sqrt(blind_sq.mean())),
-                                'blind_psnr': float(10.0 * np.log10((255.0 * 255.0) / max(float(blind_sq.mean()), 1e-12))),
-                                'blind_mae_input': in_mae,
-                                'blind_count': int(len(err))
-                            })
-                            if in_mae is not None:
-                                row['blind_mae_gain_abs'] = in_mae - row['blind_mae']
-                                row['blind_mae_gain_pct'] = 100.0 * row['blind_mae_gain_abs'] / (in_mae + 1e-12)
-                    seq_logs[seq_name].append(row)
-                    per_image_logs.append(row)
-        report.print_final_result()
-
-        # Save full-frame + blind-region per-image metrics for every test run.
         save_blind_dir = os.path.join(self.config.save_dir, 'blind_eval')
         os.makedirs(save_blind_dir, exist_ok=True)
+        total_per_image_logs = []
+        total_seq_logs = {}
+        total_seq_stats = {}
+        total_blind_abs_sum = 0.0
+        total_blind_sq_sum = 0.0
+        total_blind_abs_in_sum = 0.0
+        total_blind_sq_in_sum = 0.0
+        total_blind_pix_sum = 0
         save_blind_csv = os.path.join(save_blind_dir, 'test_blind_metrics.csv')
-        if len(per_image_logs) > 0:
-            keys = [
-                'image', 'seq', 'psnr', 'ssim',
-                'blind_mae', 'blind_rmse', 'blind_psnr',
-                'blind_mae_input', 'blind_mae_gain_abs', 'blind_mae_gain_pct', 'blind_count'
-            ]
-            with open(save_blind_csv, 'w', encoding='utf-8', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=keys)
-                writer.writeheader()
-                for row in per_image_logs:
-                    writer.writerow(row)
-            print(f"Per-image test metrics saved to: {save_blind_csv}")
 
-            # 按测试子文件夹输出独立 CSV：test_blind_metrics_<seq>.csv
-            for seq_name in sorted(seq_logs.keys(), key=natural_sort_key):
-                seq_csv = os.path.join(save_blind_dir, f"test_blind_metrics_{seq_name}.csv")
+        keys = [
+            'image', 'seq', 'psnr', 'ssim',
+            'blind_mae', 'blind_rmse', 'blind_psnr',
+            'blind_mae_input', 'blind_mae_gain_abs', 'blind_mae_gain_pct', 'blind_count'
+        ]
+        summary_keys = [
+            'seq', 'images', 'blind_count',
+            'blind_mae', 'blind_rmse', 'blind_psnr',
+            'input_blind_mae', 'input_blind_psnr',
+            'blind_mae_gain_abs', 'blind_mae_gain_pct'
+        ]
+
+        print(f"===> 开始定量打分，准备比对 {len(out_records)} 张图片...")
+        for seq_name in sorted(seq_records.keys(), key=natural_sort_key):
+            seq_recs = sorted(seq_records[seq_name], key=lambda r: natural_sort_key(r['rel_path']))
+            seq_logs = []
+            seq_stats = {
+                'blind_abs_sum': 0.0,
+                'blind_sq_sum': 0.0,
+                'blind_abs_in_sum': 0.0,
+                'blind_sq_in_sum': 0.0,
+                'blind_pix_sum': 0,
+            }
+
+            for rec in seq_recs:
+                img_name = rec['img_name']
+                rel_name = rec['rel_path']
+                out_path = rec['out_path']
+                seq_hint = '' if seq_name == 'root' else seq_name
+
+                gt_path = gt_rel_map.get(rel_name)
+                if gt_path is None and seq_hint:
+                    gt_path = gt_rel_map.get(f"{seq_hint}/{img_name}")
+                if gt_path is None:
+                    gt_path = resolve_by_name(gt_name_map, img_name, seq_hint)
+
+                if not (gt_path and os.path.exists(out_path)):
+                    continue
+
+                out_img = cv2.imread(out_path, cv2.IMREAD_GRAYSCALE)
+                gt_img = cv2.imread(gt_path, cv2.IMREAD_GRAYSCALE)
+                if gt_img is None or out_img is None:
+                    continue
+
+                if out_img.shape != gt_img.shape:
+                    out_img = cv2.resize(out_img, (gt_img.shape[1], gt_img.shape[0]))
+
+                report.update_metric(gt_img, out_img, rel_name)
+                full_psnr = float(report.total_rgb_psnr[-1])
+                full_ssim = float(report.total_ssim[-1])
+
+                row = {
+                    'image': rel_name,
+                    'seq': seq_name,
+                    'psnr': full_psnr,
+                    'ssim': full_ssim,
+                    'blind_mae': None,
+                    'blind_rmse': None,
+                    'blind_psnr': None,
+                    'blind_mae_input': None,
+                    'blind_mae_gain_abs': None,
+                    'blind_mae_gain_pct': None,
+                    'blind_count': 0,
+                }
+
+                merged_coords = []
+                h, w = gt_img.shape[:2]
+                seq_mask = resolve_seq_masks(seq_hint)
+                blind_coords = seq_mask['blind_coords']
+                flash_map = seq_mask['flash_map']
+
+                if blind_coords is not None:
+                    x = blind_coords[:, 0]
+                    y = blind_coords[:, 1]
+                    valid = (x >= 0) & (x < w) & (y >= 0) & (y < h)
+                    if np.any(valid):
+                        merged_coords.extend(list(zip(x[valid].tolist(), y[valid].tolist())))
+
+                frame_flash = flash_map.get(img_name, []) if flash_map else []
+                for (fx, fy) in frame_flash:
+                    if 0 <= fx < w and 0 <= fy < h:
+                        merged_coords.append((fx, fy))
+
+                if len(merged_coords) > 0:
+                    coords_arr = np.unique(np.array(merged_coords, dtype=np.int32), axis=0)
+                    if coords_arr.size > 0:
+                        x = coords_arr[:, 0]
+                        y = coords_arr[:, 1]
+                        gt_vals = gt_img[y, x].astype(np.float64)
+                        out_vals = out_img[y, x].astype(np.float64)
+                        err = out_vals - gt_vals
+
+                        blind_abs = np.abs(err)
+                        blind_sq = err ** 2
+
+                        blind_abs_sum = float(blind_abs.sum())
+                        blind_sq_sum = float(blind_sq.sum())
+                        blind_count = int(len(err))
+
+                        seq_stats['blind_abs_sum'] += blind_abs_sum
+                        seq_stats['blind_sq_sum'] += blind_sq_sum
+                        seq_stats['blind_pix_sum'] += blind_count
+                        total_blind_abs_sum += blind_abs_sum
+                        total_blind_sq_sum += blind_sq_sum
+                        total_blind_pix_sum += blind_count
+
+                        in_path = input_rel_map.get(rel_name)
+                        if in_path is None and seq_hint:
+                            in_path = input_rel_map.get(f"{seq_hint}/{img_name}")
+                        if in_path is None:
+                            in_path = resolve_by_name(input_name_map, img_name, seq_hint)
+
+                        in_mae = None
+                        if in_path and os.path.exists(in_path):
+                            in_img = cv2.imread(in_path, cv2.IMREAD_GRAYSCALE)
+                            if in_img is not None:
+                                if in_img.shape != gt_img.shape:
+                                    in_img = cv2.resize(in_img, (gt_img.shape[1], gt_img.shape[0]))
+                                in_vals = in_img[y, x].astype(np.float64)
+                                in_err = in_vals - gt_vals
+                                in_abs = np.abs(in_err)
+                                in_sq = in_err ** 2
+                                in_abs_sum = float(in_abs.sum())
+                                in_sq_sum = float(in_sq.sum())
+                                total_blind_abs_in_sum += in_abs_sum
+                                total_blind_sq_in_sum += in_sq_sum
+                                seq_stats['blind_abs_in_sum'] += in_abs_sum
+                                seq_stats['blind_sq_in_sum'] += in_sq_sum
+                                in_mae = float(in_abs.mean())
+
+                        row.update({
+                            'blind_mae': float(blind_abs.mean()),
+                            'blind_rmse': float(np.sqrt(blind_sq.mean())),
+                            'blind_psnr': float(10.0 * np.log10((255.0 * 255.0) / max(float(blind_sq.mean()), 1e-12))),
+                            'blind_mae_input': in_mae,
+                            'blind_count': blind_count,
+                        })
+                        if in_mae is not None:
+                            row['blind_mae_gain_abs'] = in_mae - row['blind_mae']
+                            row['blind_mae_gain_pct'] = 100.0 * row['blind_mae_gain_abs'] / (in_mae + 1e-12)
+
+                seq_logs.append(row)
+                total_per_image_logs.append(row)
+
+            total_seq_logs[seq_name] = seq_logs
+            total_seq_stats[seq_name] = seq_stats
+
+            if len(seq_logs) > 0:
+                seq_label = seq_name or 'root'
+                seq_csv = os.path.join(save_blind_dir, f"test_blind_metrics_{seq_label}.csv")
                 with open(seq_csv, 'w', encoding='utf-8', newline='') as f:
                     writer = csv.DictWriter(f, fieldnames=keys)
                     writer.writeheader()
-                    for row in seq_logs[seq_name]:
+                    for row in seq_logs:
                         writer.writerow(row)
                 print(f"Per-seq metrics saved to: {seq_csv}")
 
-            # 额外输出每个子文件夹的汇总指标，便于横向对比。
+        report.print_final_result()
+
+        if len(total_per_image_logs) > 0:
+            with open(save_blind_csv, 'w', encoding='utf-8', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=keys)
+                writer.writeheader()
+                for row in total_per_image_logs:
+                    writer.writerow(row)
+            print(f"Per-image test metrics saved to: {save_blind_csv}")
+
             summary_csv = os.path.join(save_blind_dir, 'test_blind_summary_by_seq.csv')
-            summary_keys = [
-                'seq', 'images', 'blind_count',
-                'blind_mae', 'blind_rmse', 'blind_psnr',
-                'input_blind_mae', 'input_blind_psnr',
-                'blind_mae_gain_abs', 'blind_mae_gain_pct'
-            ]
             with open(summary_csv, 'w', encoding='utf-8', newline='') as f:
                 writer = csv.DictWriter(f, fieldnames=summary_keys)
                 writer.writeheader()
-                for seq_name in sorted(seq_logs.keys(), key=natural_sort_key):
-                    st = seq_stats.get(seq_name, {})
+                for seq_name in sorted(total_seq_logs.keys(), key=natural_sort_key):
+                    st = total_seq_stats.get(seq_name, {})
                     pix = int(st.get('blind_pix_sum', 0))
                     row = {
                         'seq': seq_name,
-                        'images': len(seq_logs.get(seq_name, [])),
+                        'images': len(total_seq_logs.get(seq_name, [])),
                         'blind_count': pix,
                         'blind_mae': None,
                         'blind_rmse': None,
@@ -1125,21 +1133,20 @@ class Trainer:
                     writer.writerow(row)
             print(f"Per-seq summary saved to: {summary_csv}")
 
-        # 汇总输出盲元专项指标，便于不同模型横向比较。
-        if blind_pix_sum > 0:
-            blind_mae = blind_abs_sum / blind_pix_sum
-            blind_mse = blind_sq_sum / blind_pix_sum
+        if total_blind_pix_sum > 0:
+            blind_mae = total_blind_abs_sum / total_blind_pix_sum
+            blind_mse = total_blind_sq_sum / total_blind_pix_sum
             blind_rmse = float(np.sqrt(blind_mse))
             blind_psnr = float(10.0 * np.log10((255.0 * 255.0) / max(blind_mse, 1e-12)))
 
             print("===> Blind-Pixel Focused Metrics")
             print(f"MaskRoot: {mask_root}")
-            print(f"BlindCount(total sampled): {blind_pix_sum}")
+            print(f"BlindCount(total sampled): {total_blind_pix_sum}")
             print(f"Blind MAE: {blind_mae:.6f} | Blind RMSE: {blind_rmse:.6f} | Blind PSNR: {blind_psnr:.3f}")
 
-            if blind_abs_in_sum > 0:
-                blind_mae_in = blind_abs_in_sum / blind_pix_sum
-                blind_mse_in = blind_sq_in_sum / blind_pix_sum
+            if total_blind_abs_in_sum > 0:
+                blind_mae_in = total_blind_abs_in_sum / total_blind_pix_sum
+                blind_mse_in = total_blind_sq_in_sum / total_blind_pix_sum
                 blind_psnr_in = float(10.0 * np.log10((255.0 * 255.0) / max(blind_mse_in, 1e-12)))
                 gain_abs = blind_mae_in - blind_mae
                 gain_pct = 100.0 * gain_abs / (blind_mae_in + 1e-12)
@@ -1148,7 +1155,7 @@ class Trainer:
                     f"MAE Gain: {gain_abs:.6f} ({gain_pct:.2f}%)"
                 )
 
-            if len(per_image_logs) > 0:
+            if len(total_per_image_logs) > 0:
                 print(f"Blind per-image metrics saved to: {save_blind_csv}")
 
     def save_checkpoint(self, epoch):
