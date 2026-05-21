@@ -705,7 +705,23 @@ class Trainer:
                     rel = os.path.relpath(p, gt_root).replace('\\', '/')
                     gt_rel_finder[rel] = p
 
+        def eval_group_csv(group_name):
+            group_label = group_name if group_name else 'root'
+            group_output_dir = os.path.join(save_pure, group_name) if group_name else save_pure
+            if not os.path.isdir(group_output_dir):
+                return
+            print(f"===> 子文件夹 {group_label} 推理完成，开始生成该子文件夹 CSV...")
+            self.test_quantitative_result(
+                gt_dir=gt_root,
+                output_dir=group_output_dir,
+                image_border=0,
+                group_name=group_name if group_name else None,
+                csv_subdir=group_label,
+            )
+
         print(f"===> 开始精准推理与可视化...")
+
+        current_group = None
 
         with torch.no_grad():
             for idx, (lr_blur_seq, relative_path) in enumerate(dataloader):
@@ -735,6 +751,14 @@ class Trainer:
                     current_frame_name += '.png'
                 if not relative_name.lower().endswith('.png'):
                     relative_name += '.png'
+
+                rel_dir = os.path.dirname(relative_name).replace('\\', '/')
+                seq_name = rel_dir.split('/')[0] if rel_dir else ''
+                if current_group is None:
+                    current_group = seq_name
+                elif seq_name != current_group:
+                    eval_group_csv(current_group)
+                    current_group = seq_name
 
                 # 3. 推理核心
                 lr_blur_seq = lr_blur_seq.cuda()
@@ -780,6 +804,9 @@ class Trainer:
 
                 if (idx + 1) % 10 == 0:
                     print(f"进度: {idx + 1}/{len(dataloader)} | 正在保存: {current_frame_name}")
+
+            if current_group is not None:
+                eval_group_csv(current_group)
 
     pass
 

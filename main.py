@@ -199,22 +199,9 @@ def test(config):
     gt_root = os.path.join(config.dataset_path, 'test_sharp')
     output_root = os.path.join(config.save_dir, 'test') # 对应 Trainer.test 里的保存位置
 
-    print("===> Starting Quantitative Evaluation...")
-    if os.path.isdir(output_root):
-        group_dirs = [d for d in os.listdir(output_root) if os.path.isdir(os.path.join(output_root, d))]
-        group_dirs = sorted(group_dirs, key=natural_sort_key)
-        for group_name in group_dirs:
-            group_output_dir = os.path.join(output_root, group_name)
-            print(f"===> Starting Quantitative Evaluation for group {group_name}...")
-            trainer.test_quantitative_result(
-                gt_dir=gt_root,
-                output_dir=group_output_dir,
-                image_border=0,
-                group_name=group_name,
-                csv_subdir=group_name,
-            )
-
-    # 最后再做一次全量汇总，保证总 csv 和总 blind summary 存在。
+    # 子文件夹 CSV 已在 trainer.test() 内按子文件夹切换时即时生成。
+    # 这里只做一次全量汇总，保证总 csv 和总 blind summary 存在。
+    print("===> Starting Final Quantitative Summary...")
     trainer.test_quantitative_result(
         gt_dir=gt_root,
         output_dir=output_root,
