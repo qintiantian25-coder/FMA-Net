@@ -13,3 +13,4 @@ experiments/
 lightning_logs/
 *.pth
 *.ckpt
+xixi.py
