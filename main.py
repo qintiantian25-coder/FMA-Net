@@ -34,11 +34,10 @@ def train(config):
     model = FMANet(config=config)
 
     # torch.compile 加速 (PyTorch >= 2.0, 需 Triton / Linux)
-    if getattr(config, 'use_compile', True) and hasattr(torch, 'compile'):
+    _compile_model = getattr(config, 'use_compile', True)
+    if _compile_model and hasattr(torch, 'compile'):
         try:
-            import triton
-            # CUDAGraphs 与 ImageBWarp 内部 objBackwarpcache 冲突，关闭
-            import torch._inductor.config
+            import triton  # noqa: F811
             torch._inductor.config.triton.cudagraphs = False
             model = torch.compile(model, mode='reduce-overhead')
             print('[*] torch.compile enabled (mode=reduce-overhead, cudagraphs=False)')
