@@ -110,9 +110,10 @@ def backwarp(x, flow, objBackwarpcache):
         flow = flow * torch.tensor(data=[2.0 / (flow.shape[3] - 1.0), 2.0 / (flow.shape[2] - 1.0)], dtype=flow.dtype,
                                    device=flow.device).view(1, 2, 1, 1)
 
-    return nn.functional.grid_sample(input=x, grid=(objBackwarpcache['grid' + str(flow.dtype) + str(flow.device) + str(
-        flow.shape[2]) + str(flow.shape[3])] + flow).permute(0, 2, 3, 1), mode='bilinear', padding_mode='zeros',
-                                     align_corners=True)
+    cached_grid = objBackwarpcache['grid' + str(flow.dtype) + str(flow.device) + str(
+        flow.shape[2]) + str(flow.shape[3])]
+    return nn.functional.grid_sample(input=x, grid=(cached_grid.clone() + flow).permute(0, 2, 3, 1),
+                                     mode='bilinear', padding_mode='zeros', align_corners=True)
 
 
 class ImageBWarp(torch.nn.Module):
