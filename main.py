@@ -184,8 +184,9 @@ def train(config):
                     pass
                 print(f"[*] New Best BlindPSNR saved at Epoch {epoch + 1} | BlindPSNR: {best_blind_psnr:.3f}")
 
-            # 只有当 PSNR 与 BlindPSNR 同时提升时，更新并保存通用 model_best.pt
-            if better_by_psnr and better_by_blindpsnr and current_blind_psnr is not None:
+            # Stage1: PSNR 提升即保存 model_best.pt（无盲元指标）
+            # Stage2: PSNR 与 BlindPSNR 同时提升时才保存
+            if better_by_psnr and (current_blind_psnr is None or (better_by_blindpsnr and current_blind_psnr is not None)):
                 try:
                     trainer.save_best_model(epoch)
                     print(f"[*] New Best (PSNR+BlindPSNR) saved at Epoch {epoch + 1}")

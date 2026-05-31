@@ -1324,12 +1324,14 @@ class Trainer:
         print("[*] Loaded Best Model.")
 
     def load_best_stage1_model(self):
-        # Prefer explicit stage1_pretrained_dir so Stage2 can save to a new folder safely.
         if getattr(self.config, 'stage1_pretrained_dir', ''):
             stage1_path = os.path.join(self.config.stage1_pretrained_dir, 'model_stage1')
         else:
             stage1_path = self.checkpoint_path.replace('stage2', 'stage1')
+        # 优先 model_best.pt，回退 model_best_psnr.pt（Stage1 仅按 PSNR 保存）
         best_path = os.path.join(stage1_path, 'model_best.pt')
+        if not os.path.exists(best_path):
+            best_path = os.path.join(stage1_path, 'model_best_psnr.pt')
         ckpt = torch.load(best_path)
         self.model.degradation_learning_network.load_state_dict(ckpt['model_D_state_dict'])
         print(f"[*] Loaded Stage 1 Best Net_D from {best_path}")
