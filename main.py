@@ -33,12 +33,14 @@ def train(config):
 
     model = FMANet(config=config)
 
-    # torch.compile 加速 (PyTorch >= 2.0)
-    if getattr(config, 'use_compile', True):
+    # torch.compile 加速 (PyTorch >= 2.0, 需 Triton / Linux)
+    if getattr(config, 'use_compile', True) and hasattr(torch, 'compile'):
         try:
-            if hasattr(torch, 'compile'):
-                model = torch.compile(model, mode='reduce-overhead')
-                print('[*] torch.compile enabled (mode=reduce-overhead)')
+            import triton
+            model = torch.compile(model, mode='reduce-overhead')
+            print('[*] torch.compile enabled (mode=reduce-overhead)')
+        except ImportError:
+            print('[!] Triton not available — torch.compile disabled (Windows 不支持 Triton)')
         except Exception as e:
             print(f'[!] torch.compile failed (skipping): {e}')
 
