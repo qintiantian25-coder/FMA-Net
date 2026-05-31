@@ -37,8 +37,10 @@ def train(config):
     if getattr(config, 'use_compile', True) and hasattr(torch, 'compile'):
         try:
             import triton
-            model = torch.compile(model, mode='reduce-overhead')
-            print('[*] torch.compile enabled (mode=reduce-overhead)')
+            # CUDAGraphs 与 ImageBWarp 内部 objBackwarpcache 冲突，关闭
+            model = torch.compile(model, mode='reduce-overhead',
+                                  options={'triton.cudagraphs': False})
+            print('[*] torch.compile enabled (mode=reduce-overhead, cudagraphs=False)')
         except ImportError:
             print('[!] Triton not available — torch.compile disabled (Windows 不支持 Triton)')
         except Exception as e:
