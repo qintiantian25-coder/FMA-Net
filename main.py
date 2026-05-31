@@ -32,6 +32,16 @@ def train(config):
     val_dataloader = get_dataset(config, type='val')
 
     model = FMANet(config=config)
+
+    # torch.compile 加速 (PyTorch >= 2.0)
+    if getattr(config, 'use_compile', True):
+        try:
+            if hasattr(torch, 'compile'):
+                model = torch.compile(model, mode='reduce-overhead')
+                print('[*] torch.compile enabled (mode=reduce-overhead)')
+        except Exception as e:
+            print(f'[!] torch.compile failed (skipping): {e}')
+
     trainer = Trainer(config=config, model=model)
 
     print(f'num parameters: {count_parameters(model)}')

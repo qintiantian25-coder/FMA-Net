@@ -545,10 +545,31 @@ class Net_R(torch.nn.Module):
 
         self.blind_res_conv1 = nn.Conv2d(dim, dim, kernel_size=3, padding=1, stride=1, bias=bias)
         self.blind_res_conv2 = nn.Conv2d(dim, in_channels, kernel_size=3, padding=1, stride=1, bias=bias)
-        self.blind_gate_conv = nn.Conv2d(dim, 1, kernel_size=3, padding=1, stride=1, bias=bias)
-        self.blind_gate_act = nn.Sigmoid()
+        # SE channel attention 增强盲元残差分支
+        se_reduction = max(1, dim // 4)
+        self.blind_se = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(dim, se_reduction, 1, bias=False),
+            nn.ReLU(True),
+            nn.Conv2d(se_reduction, dim, 1, bias=False),
+            nn.Sigmoid()
+        )
+        # 多层盲元 Gate 网络 (替代单层 Conv2d)
+        gate_hidden1 = max(1, dim // 2)
+        gate_hidden2 = max(1, dim // 4)
+        self.blind_gate = nn.Sequential(
+            nn.Conv2d(dim, gate_hidden1, 3, 1, 1, bias=bias),
+            nn.LeakyReLU(0.2, True),
+            nn.Conv2d(gate_hidden1, gate_hidden2, 3, 1, 1, bias=bias),
+            nn.LeakyReLU(0.2, True),
+            nn.Conv2d(gate_hidden2, 1, 3, 1, 1, bias=bias),
+            nn.Sigmoid()
+        )
 
         self.blind_infer_threshold = float(getattr(config, 'blind_infer_threshold', 0.10))
+        # 可学习盲元判定阈值 (用于 _build_blind_masks)
+        self.blind_threshold_param = nn.Parameter(
+            torch.tensor(float(getattr(config, 'blind_mask_threshold', 0.025)), dtype=torch.float32))
 
         self.r_conv = nn.Sequential(
             nn.Conv3d(dim // num_seq, dim, kernel_size=[1, 3, 3], padding=[0, 1, 1], stride=1, bias=bias),
@@ -595,10 +616,11 @@ class Net_R(torch.nn.Module):
         _, warped_X = self.bwarp(x, f_X_final)
         duf_output = self.duf(warped_X, KR)
 
-        # 3. 盲元预测与掩码
+        # 3. 盲元预测与掩码 (SE-enhanced)
         blind_feat = self.relu(self.blind_res_conv1(Fw))
+        blind_feat = blind_feat * self.blind_se(blind_feat)
         raw_blind_res = self.blind_res_conv2(blind_feat)
-        blind_gate = self.blind_gate_act(self.blind_gate_conv(blind_feat))
+        blind_gate = self.blind_gate(blind_feat)
 
         base_alpha = torch.sigmoid(self.base_alpha_param).to(Fw.device)
         base_beta = torch.sigmoid(self.base_beta_param).to(Fw.device)

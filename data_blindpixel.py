@@ -152,6 +152,44 @@ class BlindPixelDataset(Dataset):
                 flow_tensor = flow_tensor[:, :, :, ::-1]
                 flow_tensor[:, 0, :, :] *= -1
 
+            # 随机垂直翻转
+            if random.random() < 0.5:
+                blur_seq = blur_seq[:, ::-1, :]
+                sharp_seq = sharp_seq[:, ::-1, :]
+                flow_tensor = flow_tensor[:, :, ::-1, :]
+                flow_tensor[:, 1, :, :] *= -1
+
+            # 随机 90° 旋转 (k ∈ {0, 1, 2, 3})，适配灰度图
+            k = random.randint(0, 3)
+            if k > 0:
+                blur_seq = np.rot90(blur_seq, k=k, axes=(1, 2)).copy()
+                sharp_seq = np.rot90(sharp_seq, k=k, axes=(1, 2)).copy()
+                # 光流旋转：先旋转空间维度，再调整方向
+                flow_tensor = np.rot90(np.ascontiguousarray(flow_tensor), k=k, axes=(2, 3)).copy()
+                if k == 1:
+                    flow_tensor[:, [0, 1], :, :] = -flow_tensor[:, [1, 0], :, :]
+                elif k == 3:
+                    flow_tensor[:, [0, 1], :, :] = flow_tensor[:, [1, 0], :, :]
+                    flow_tensor[:, 0, :, :] *= -1
+                elif k == 2:
+                    flow_tensor[:, 0, :, :] *= -1
+                    flow_tensor[:, 1, :, :] *= -1
+
+            # 随机亮度/对比度调整 (灰度图)
+            if random.random() < 0.3:
+                contrast = random.uniform(0.85, 1.15)
+                brightness = random.uniform(-0.03, 0.03)
+                blur_seq = np.clip(blur_seq * contrast + brightness, 0.0, 1.0)
+                sharp_seq = np.clip(sharp_seq * contrast + brightness, 0.0, 1.0)
+
+            # 时序随机反转
+            if random.random() < 0.3:
+                blur_seq = blur_seq[::-1]
+                sharp_seq = sharp_seq[::-1]
+                flow_tensor = flow_tensor[::-1]
+                flow_tensor[:, 0, :, :] *= -1
+                flow_tensor[:, 1, :, :] *= -1
+
         # 4. 封装 Tensor
         lr_blur_seq = torch.from_numpy(blur_seq.copy()).unsqueeze(0)
         hr_sharp_seq = torch.from_numpy(sharp_seq.copy()).unsqueeze(0)

@@ -90,7 +90,19 @@ class Config:
         self.min_lr = float(parser.get('training', 'min_lr', fallback='1e-6'))
         self.overflow_lr_decay_cooldown = int(parser.get('training', 'overflow_lr_decay_cooldown', fallback='200'))
         self.overflow_log_interval = int(parser.get('training', 'overflow_log_interval', fallback='50'))
+
+        # --- 增强损失函数权重 (Phase 1) ---
+        self.ssim_loss_weight = float(parser.get('loss', 'ssim_loss_weight', fallback='0.1'))
+        self.blind_ssim_loss_weight = float(parser.get('loss', 'blind_ssim_loss_weight', fallback='0.2'))
+        self.grad_loss_weight = float(parser.get('loss', 'grad_loss_weight', fallback='0.05'))
+        self.blind_fft_loss_weight = float(parser.get('loss', 'blind_fft_loss_weight', fallback='0.05'))
+        self.charbonnier_eps = float(parser.get('loss', 'charbonnier_eps', fallback='1e-3'))
         self.amp_recovery_steps = int(parser.get('training', 'amp_recovery_steps', fallback='128'))
+
+        # --- 训练策略增强 (Phase 3) ---
+        self.warmup_epochs = int(parser.get('training', 'warmup_epochs', fallback='3'))
+        self.use_compile = parser.getboolean('training', 'use_compile', fallback=True)
+        self.grad_accum_steps = int(parser.get('training', 'grad_accum_steps', fallback='1'))
 
         # Network
         self.in_channels = int(parser.get('network', 'in_channels'))

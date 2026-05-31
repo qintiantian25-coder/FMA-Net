@@ -21,7 +21,7 @@ class Trainer:
         if self.config.save_train_img:
             self.save_manager = SaveManager(config)
 
-        # 基础损失函数
+        # 基础损失函数：L1 保留用于 flow/TA 等辅助损失
         self.criterion = nn.L1Loss()
 
         # 学习率调度：
@@ -33,6 +33,7 @@ class Trainer:
         use_dynamic_after_drop = bool(getattr(self.config, 'lr_dynamic_after_drop', False))
         lr_drop_epoch = int(getattr(self.config, 'lr_drop_epoch', -1))
         lr_after_drop = float(getattr(self.config, 'lr_after_drop', 0.0))
+        warmup_epochs = int(getattr(self.config, 'warmup_epochs', 0))
 
         if use_dynamic_after_drop and lr_drop_epoch > 0 and self.config.num_epochs > lr_drop_epoch and self.config.lr > 0:
             start_lr = lr_after_drop if lr_after_drop > 0 else self.config.lr
@@ -42,9 +43,13 @@ class Trainer:
             denom = max(1, self.config.num_epochs - lr_drop_epoch - 1)
 
             def _lr_lambda(epoch_idx):
-                # epoch_idx是scheduler内部已完成的epoch计数；这样可保证drop前训练轮次保持固定学习率。
+                # Warmup phase: linear ramp from 0 to base_lr
+                if epoch_idx < warmup_epochs:
+                    return float(epoch_idx + 1) / max(1, warmup_epochs)
+                # Constant until drop_epoch
                 if epoch_idx < lr_drop_epoch:
                     return 1.0
+                # Cosine decay after drop_epoch
                 t = min(1.0, max(0.0, (epoch_idx - lr_drop_epoch) / denom))
                 return float(min_factor + 0.5 * (start_factor - min_factor) * (1.0 + np.cos(np.pi * t)))
 
@@ -187,6 +192,41 @@ class Trainer:
                 return False
         return True
 
+    def _charbonnier(self, pred, target):
+        """Charbonnier 损失：比 L1 更平滑，对异常值更鲁棒"""
+        eps = float(getattr(self.config, 'charbonnier_eps', 1e-3))
+        return torch.sqrt((pred - target) ** 2 + eps ** 2).mean()
+
+    def _ssim_loss(self, pred, target):
+        """可微 SSIM 损失 (1 - SSIM)"""
+        C1 = (0.01 * 1.0) ** 2
+        C2 = (0.03 * 1.0) ** 2
+        kernel = torch.ones(1, 1, 11, 11, device=pred.device, dtype=pred.dtype) / 121.0
+        mu_p = F.conv2d(pred, kernel, padding=5, groups=1)
+        mu_t = F.conv2d(target, kernel, padding=5, groups=1)
+        sigma_p = F.conv2d(pred * pred, kernel, padding=5, groups=1) - mu_p ** 2
+        sigma_t = F.conv2d(target * target, kernel, padding=5, groups=1) - mu_t ** 2
+        sigma_pt = F.conv2d(pred * target, kernel, padding=5, groups=1) - mu_p * mu_t
+        ssim_map = ((2 * mu_p * mu_t + C1) * (2 * sigma_pt + C2)) / \
+                   ((mu_p ** 2 + mu_t ** 2 + C1) * (sigma_p + sigma_t + C2) + 1e-8)
+        return (1.0 - ssim_map).mean()
+
+    def _grad_loss(self, pred, target):
+        """Sobel 梯度一致性损失：约束边缘锐度"""
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=pred.dtype, device=pred.device).view(1, 1, 3, 3)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=pred.dtype, device=pred.device).view(1, 1, 3, 3)
+        grad_p_x = F.conv2d(pred, sobel_x, padding=1)
+        grad_p_y = F.conv2d(pred, sobel_y, padding=1)
+        grad_t_x = F.conv2d(target, sobel_x, padding=1)
+        grad_t_y = F.conv2d(target, sobel_y, padding=1)
+        return self._charbonnier(grad_p_x, grad_t_x) + self._charbonnier(grad_p_y, grad_t_y)
+
+    def _fft_loss(self, pred, target):
+        """频域损失：约束高频分量恢复"""
+        pred_fft = torch.fft.rfft2(pred.float())
+        target_fft = torch.fft.rfft2(target.float())
+        return self._charbonnier(torch.abs(pred_fft), torch.abs(target_fft))
+
     def smart_recon_loss(self, recon, target):
         # Run hard blind-pixel weighting in fp32 to reduce overflow risk under AMP.
         recon_f = recon.float()
@@ -221,7 +261,11 @@ class Trainer:
         if lr_center.shape[-2:] != hr_center.shape[-2:]:
             hr_center = F.interpolate(hr_center, size=lr_center.shape[-2:], mode='bilinear', align_corners=False)
 
-        blind_thr = getattr(self.config, 'blind_mask_threshold', 0.08)
+        # 优先使用 Net_R 中可学习的盲元判定阈值
+        if hasattr(self.model, 'restoration_network') and hasattr(self.model.restoration_network, 'blind_threshold_param'):
+            blind_thr = torch.sigmoid(self.model.restoration_network.blind_threshold_param).to(lr_center.device)
+        else:
+            blind_thr = getattr(self.config, 'blind_mask_threshold', 0.08)
         diff = torch.abs(lr_center - hr_center)
         blind_mask = (diff >= blind_thr).float()
         non_blind_mask = 1.0 - blind_mask
@@ -326,6 +370,7 @@ class Trainer:
         self.model.train()
         report = Train_Report()
         start = time.time()
+        grad_accum = max(1, int(getattr(self.config, 'grad_accum_steps', 1)))
 
         for idx, (lr_blur_seq, hr_sharp_seq, lr_sharp_seq, flow) in enumerate(dataloader):
             lr_blur_seq = lr_blur_seq.cuda(non_blocking=True)
@@ -333,6 +378,7 @@ class Trainer:
             lr_sharp_seq = lr_sharp_seq.cuda(non_blocking=True)
             flow = flow.cuda(non_blocking=True)
             batch_size, _, t, _, _ = lr_blur_seq.shape
+            is_accum_step = ((idx + 1) % grad_accum == 0) or (idx == len(dataloader) - 1)
 
             # Stage-2 uses an explicit blind mask from GT difference; stage-1 keeps original forward.
             blind_mask = None
@@ -376,8 +422,9 @@ class Trainer:
                     D_TA_loss = self.config.D_TA_loss_weight * self.criterion(result_dict['F_sharp_D'].float(),
                                                                               lr_sharp_seq.float())
 
-                    total_loss = recon_loss + hr_warping_loss + flow_loss + D_TA_loss
-                    self.optimizer_D.zero_grad(set_to_none=True)
+                    total_loss = (recon_loss + hr_warping_loss + flow_loss + D_TA_loss) / grad_accum
+                    if idx % grad_accum == 0:
+                        self.optimizer_D.zero_grad(set_to_none=True)
 
                 elif self.config.stage == 2:
                     center_hr_2d = hr_sharp_seq[:, :, t // 2, :, :]
@@ -389,40 +436,68 @@ class Trainer:
                     non_blind_mask_2d = 1.0 - blind_mask_2d
                     non_blind_pixels = non_blind_mask_2d.sum().clamp_min(1.0)
 
-                    # restoration_loss: 仅在非盲元区域计算（按像素平均），避免与盲元分支冲突
-                    restoration_loss = (torch.abs(center_out - center_hr_2d) * non_blind_mask_2d).sum() / non_blind_pixels
+                    # restoration_loss: Charbonnier on non-blind region only
+                    eps = float(getattr(self.config, 'charbonnier_eps', 1e-3))
+                    diff = center_out - center_hr_2d
+                    char_diff = torch.sqrt(diff ** 2 + eps ** 2)
+                    restoration_loss = (char_diff * non_blind_mask_2d).sum() / non_blind_pixels
                     # restoration_loss_weight 由配置文件固定控制（避免可学习导致非盲区保护被削弱）
                     restoration_weight = float(getattr(self.config, 'restoration_loss_weight', 1.0))
 
-                    # blind_res_loss: 对 blind_res 分支只在盲区做平均残差监督（按盲元像素平均）
+                    # blind_res_loss: Charbonnier on blind_res against target residual
                     with torch.no_grad():
                         target_res = center_hr_2d - result_dict['base_output']
-                    masked_res_abs = torch.abs(result_dict['blind_res'] - target_res) * blind_mask_2d
-                    blind_res_loss = masked_res_abs.sum() / blind_pixels
+                    res_diff = result_dict['blind_res'] - target_res
+                    blind_res_loss = (torch.sqrt(res_diff ** 2 + eps ** 2) * blind_mask_2d).sum() / blind_pixels
 
                     # recon_loss 保持不变（Net_D 的重建监督）
                     recon_loss = self.config.Net_D_weight * self.smart_recon_loss(
                         result_dict['recon'], lr_blur_seq[:, :, t // 2, :, :]
                     )
 
-                    # blind_restore_loss: final output 在盲区的平均 L1（保持做为评估与损失项）
-                    blind_l1 = (torch.abs(center_out - center_hr_2d) * blind_mask_2d).sum() / blind_pixels
+                    # blind_restore_loss: Charbonnier on final output in blind region
+                    blind_char = (char_diff * blind_mask_2d).sum() / blind_pixels
                     # 使用可学习权重参数
                     if hasattr(self.model, 'restoration_network'):
                         rn = self.model.restoration_network
                         blind_restore_weight = torch.nn.functional.softplus(rn.blind_restore_loss_weight_param.to(center_out.device)) if hasattr(rn, 'blind_restore_loss_weight_param') else float(getattr(self.config, 'blind_restore_loss_weight', 0.6))
                     else:
                         blind_restore_weight = float(getattr(self.config, 'blind_restore_loss_weight', 0.6))
-                    blind_restore_loss = blind_restore_weight * blind_l1
+                    blind_restore_loss = blind_restore_weight * blind_char
 
-                    # lr_warping_loss: 仍使用非盲区作为监督（和原逻辑一致）
+                    # --- 增强损失：SSIM / 梯度 / 频域 ---
+                    ssim_weight = float(getattr(self.config, 'ssim_loss_weight', 0.1))
+                    blind_ssim_weight = float(getattr(self.config, 'blind_ssim_loss_weight', 0.2))
+                    grad_weight = float(getattr(self.config, 'grad_loss_weight', 0.05))
+                    fft_weight = float(getattr(self.config, 'blind_fft_loss_weight', 0.05))
+
+                    ssim_loss = torch.tensor(0.0, device=center_out.device)
+                    blind_ssim_loss = torch.tensor(0.0, device=center_out.device)
+                    grad_loss = torch.tensor(0.0, device=center_out.device)
+                    blind_fft_loss = torch.tensor(0.0, device=center_out.device)
+
+                    if ssim_weight > 0:
+                        ssim_loss = self._ssim_loss(center_out, center_hr_2d)
+                    if blind_ssim_weight > 0 and blind_pixels.item() > 0:
+                        blind_out_masked = center_out * blind_mask_2d
+                        blind_hr_masked = center_hr_2d * blind_mask_2d
+                        blind_ssim_loss = self._ssim_loss(blind_out_masked, blind_hr_masked)
+                    if grad_weight > 0:
+                        grad_loss = self._grad_loss(center_out, center_hr_2d)
+                    if fft_weight > 0 and blind_pixels.item() > 0:
+                        blind_out_masked = center_out * blind_mask_2d
+                        blind_hr_masked = center_hr_2d * blind_mask_2d
+                        blind_fft_loss = self._fft_loss(blind_out_masked, blind_hr_masked)
+
+                    # lr_warping_loss: Charbonnier on non-blind region
                     center_lr = lr_blur_seq[:, :, t // 2:t // 2 + 1, :, :]
                     non_blind_mask = 1.0 - blind_mask
                     target_lr = center_lr.expand(-1, -1, t, -1, -1)
                     non_blind_mask_t = non_blind_mask.expand(-1, -1, t, -1, -1)
                     valid_non_blind = non_blind_mask_t.sum().clamp_min(1.0)
-                    masked_l1 = (torch.abs(result_dict['lr_warp'].float() - target_lr.float()) * non_blind_mask_t.float()).sum() / valid_non_blind
-                    lr_warping_loss = self.config.lr_warping_loss_weight * masked_l1
+                    warp_diff = result_dict['lr_warp'].float() - target_lr.float()
+                    masked_char = (torch.sqrt(warp_diff ** 2 + eps ** 2) * non_blind_mask_t.float()).sum() / valid_non_blind
+                    lr_warping_loss = self.config.lr_warping_loss_weight * masked_char
 
                     hr_target = hr_sharp_seq[:, :, t // 2:t // 2 + 1, :, :].expand(-1, -1, t, -1, -1)
                     hr_warping_loss = self.config.Net_D_weight * self.config.hr_warping_loss_weight * self.criterion(
@@ -463,9 +538,10 @@ class Trainer:
                         boundary_mask = (dilated - blind_mask_2d).clamp(min=0.0)
                     boundary_pixels = boundary_mask.sum().clamp_min(1.0)
 
-                    # 边界一致性损失：鼓励 final output 在边界处更接近 base_output（减少溢出替换）
+                    # 边界一致性损失：Charbonnier
                     boundary_loss_weight = float(getattr(self.config, 'blind_boundary_loss_weight', 1.0))
-                    boundary_loss = (torch.abs(center_out - result_dict['base_output']) * boundary_mask).sum() / boundary_pixels
+                    bd_diff = center_out - result_dict['base_output']
+                    boundary_loss = (torch.sqrt(bd_diff ** 2 + eps ** 2) * boundary_mask).sum() / boundary_pixels
 
                     # gate 平滑与稀疏约束（防止 gate 在边界处过于激进）
                     blind_gate = result_dict.get('blind_gate', None)
@@ -490,15 +566,20 @@ class Trainer:
                         restoration_weight * restoration_loss
                         + blind_restore_loss
                         + (blind_res_loss * blind_res_loss_weight)
+                        + ssim_weight * ssim_loss
+                        + blind_ssim_weight * blind_ssim_loss
+                        + grad_weight * grad_loss
+                        + fft_weight * blind_fft_loss
                         + recon_loss + hr_warping_loss + lr_warping_loss
                         + flow_loss + R_TA_loss + D_TA_loss
                         + boundary_loss_weight * boundary_loss
                         + gate_tv_weight * gate_tv_loss
                         + float(getattr(self.config, 'blind_gate_sparsity_weight', 0.0)) * gate_sparsity_loss
-                    )
+                    ) / grad_accum
 
-                    self.optimizer_D.zero_grad(set_to_none=True)
-                    self.optimizer_R.zero_grad(set_to_none=True)
+                    if idx % grad_accum == 0:
+                        self.optimizer_D.zero_grad(set_to_none=True)
+                        self.optimizer_R.zero_grad(set_to_none=True)
 
                 # 反向传播逻辑
                 if not torch.isfinite(total_loss):
@@ -513,6 +594,9 @@ class Trainer:
                 if amp_enabled:
                     prev_scale = self.scaler.get_scale()
                     self.scaler.scale(total_loss).backward()
+                    if not is_accum_step:
+                        global_step += 1
+                        continue
                     self.scaler.unscale_(self.optimizer_D)
                     if self.config.stage == 2: self.scaler.unscale_(self.optimizer_R)
                     self._clip_gradients()
@@ -532,6 +616,9 @@ class Trainer:
                         self.overflow_streak = 0
                 else:
                     total_loss.backward()
+                    if not is_accum_step:
+                        global_step += 1
+                        continue
                     self._clip_gradients()
                     if not self._all_grads_finite():
                         self.optimizer_D.zero_grad(set_to_none=True)
@@ -539,8 +626,9 @@ class Trainer:
                         self._handle_overflow(train_log, global_step, f'non_finite_grad_stage{self.config.stage}')
                         global_step += 1
                         continue
-                    self.optimizer_D.step()
-                    if self.config.stage == 2: self.optimizer_R.step()
+                    if is_accum_step:
+                        self.optimizer_D.step()
+                        if self.config.stage == 2: self.optimizer_R.step()
                     self.overflow_streak = 0
 
                 if self.config.stage == 1:
