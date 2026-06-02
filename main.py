@@ -6,7 +6,7 @@ import re
 import numpy as np
 import numbers
 
-from model import FMANet
+from model import FGAFNet
 from train import Trainer
 # 修正：根据 utils.py 实际的类名进行导入
 from utils import Train_Report as Report
@@ -31,7 +31,7 @@ def train(config):
     # 保持变量名统一：使用 val_dataloader
     val_dataloader = get_dataset(config, type='val')
 
-    model = FMANet(config=config)
+    model = FGAFNet(config=config)
     trainer = Trainer(config=config, model=model)
 
     print(f'num parameters: {count_parameters(model)}')
@@ -184,7 +184,7 @@ def train(config):
 def test(config):
     # 1. 加载测试数据
     test_dataloader = get_dataset(config, type='test')
-    model = FMANet(config=config)
+    model = FGAFNet(config=config)
     trainer = Trainer(config=config, model=model)
 
     # 2. 加载最优权重
@@ -195,7 +195,7 @@ def test(config):
 
     # 4. 定量评估 (PSNR/SSIM)
     # 修改点：gt_dir 必须指向你真实的 test_sharp 文件夹
-    # 假设你的目录是：D:/mangyuan/FMA-Net/data/test_sharp
+    # 假设你的目录是：D:/mangyuan/FGAF-Net/data/test_sharp
     gt_root = os.path.join(config.dataset_path, 'test_sharp')
     output_root = os.path.join(config.save_dir, 'test') # 对应 Trainer.test 里的保存位置
 
@@ -218,7 +218,7 @@ def test(config):
 #         data, batch_size=1, drop_last=False, shuffle=False,
 #         num_workers=int(config.nThreads), pin_memory=True
 #     )
-#     model = FMANet(config=config)
+#     model = FGAFNet(config=config)
 #     trainer = Trainer(config=config, model=model)
 #     trainer.load_best_model()
 #     trainer.test(test_dataloader)

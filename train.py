@@ -55,7 +55,7 @@ class Trainer:
                 milestones = [lr_drop_epoch]
                 gamma = max(1e-8, min(1.0, lr_after_drop / self.config.lr))
 
-        # 优化器与调度器：退化学习网络 (Net_D)
+        # 优化器与调度器：盲元退化网络 (BDNet)
         self.optimizer_D = torch.optim.Adam(
             self.model.degradation_learning_network.parameters(),
             lr=self.config.lr
@@ -67,7 +67,7 @@ class Trainer:
                 self.optimizer_D, milestones=milestones, gamma=gamma
             )
 
-        # 优化器与调度器：恢复网络 (Net_R) - 仅在 Stage 2 开启
+        # 优化器与调度器：盲元恢复网络 (BRNet) - 仅在 Stage 2 开启
         if self.config.stage == 2:
             self.optimizer_R = torch.optim.Adam(
                 self.model.restoration_network.parameters(),
@@ -400,8 +400,8 @@ class Trainer:
                     masked_res_abs = torch.abs(result_dict['blind_res'] - target_res) * blind_mask_2d
                     blind_res_loss = masked_res_abs.sum() / blind_pixels
 
-                    # recon_loss 保持不变（Net_D 的重建监督）
-                    recon_loss = self.config.Net_D_weight * self.smart_recon_loss(
+                    # recon_loss 保持不变（BDNet 的重建监督）
+                    recon_loss = self.config.BDNet_weight * self.smart_recon_loss(
                         result_dict['recon'], lr_blur_seq[:, :, t // 2, :, :]
                     )
 
@@ -425,19 +425,19 @@ class Trainer:
                     lr_warping_loss = self.config.lr_warping_loss_weight * masked_l1
 
                     hr_target = hr_sharp_seq[:, :, t // 2:t // 2 + 1, :, :].expand(-1, -1, t, -1, -1)
-                    hr_warping_loss = self.config.Net_D_weight * self.config.hr_warping_loss_weight * self.criterion(
+                    hr_warping_loss = self.config.BDNet_weight * self.config.hr_warping_loss_weight * self.criterion(
                         result_dict['hr_warp'].float(), hr_target.float()
                     )
 
                     b, _, t, h, w = result_dict['image_flow'].size()
                     # Apply flow_loss_scale consistently in stage 2 as well
                     flow_scale = float(getattr(self.config, 'flow_loss_scale', 10.0))
-                    flow_loss = self.config.Net_D_weight * flow_scale * self.config.flow_loss_weight * self.criterion(
+                    flow_loss = self.config.BDNet_weight * flow_scale * self.config.flow_loss_weight * self.criterion(
                         result_dict['image_flow'].float(), flow.view(b, 2, t, h, w).float()
                     )
 
                     R_TA_loss = self.config.R_TA_loss_weight * self.criterion(result_dict['F_sharp_R'].float(), lr_sharp_seq.float())
-                    D_TA_loss = self.config.Net_D_weight * self.config.D_TA_loss_weight * self.criterion(
+                    D_TA_loss = self.config.BDNet_weight * self.config.D_TA_loss_weight * self.criterion(
                         result_dict['F_sharp_D'].float(), lr_sharp_seq.float()
                     )
 
@@ -1244,4 +1244,4 @@ class Trainer:
         best_path = os.path.join(stage1_path, 'model_best.pt')
         ckpt = torch.load(best_path)
         self.model.degradation_learning_network.load_state_dict(ckpt['model_D_state_dict'])
-        print(f"[*] Loaded Stage 1 Best Net_D from {best_path}")
+        print(f"[*] Loaded Stage 1 Best BDNet from {best_path}")

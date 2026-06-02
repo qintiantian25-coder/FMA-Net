@@ -6,10 +6,10 @@ import numbers
 from einops import rearrange
 
 
-# FMA-Net 核心模型代碼
+# FGAF-Net (Flow-Guided Adaptive Fusion Network for Infrared Blind Pixel Restoration) 核心模型代碼
 # 功能:這是一個兩階段的視頻恢復網絡。
-# 第一階段(NetD)學習圖像如何變模糊，生成退化內核和對齊光流;
-# 第二階段(NetR)利用這些特徵，通過多頭注意力和動態上採樣，將模糊序列還原。
+# 第一階段(BDNet)學習圖像如何變模糊，生成退化內核和對齊光流;
+# 第二階段(BRNet)利用這些特徵，通過多頭注意力和動態上採樣，將模糊序列還原。
 
 def to_3d(x):
     return rearrange(x, 'b c h w -> b (h w) c')
@@ -290,7 +290,7 @@ class FeedForward(nn.Module):
         return x
 
 
-# ========================== 原始交叉注意力 (用于 Net_D) ==========================
+# ========================== 原始交叉注意力 (用於 BDNet) ==========================
 class Attention(nn.Module):
     def __init__(self, dim, num_heads, bias):
         super(Attention, self).__init__()
@@ -320,7 +320,7 @@ class Attention(nn.Module):
         return out
 
 
-# ========================== Restormer 风格注意力 (MDTA，用于 Net_R) ==========================
+# ========================== Restormer 风格注意力 (MDTA，用於 BRNet) ==========================
 class RestormerAttention(nn.Module):
     """
     Restormer-style MDTA: computes self-attention over channel projections.
@@ -368,7 +368,7 @@ class RestormerAttention(nn.Module):
 # ========================== MultiAttentionBlock (可指定注意力类型) ==========================
 class MultiAttentionBlock(torch.nn.Module):
     def __init__(self, dim, num_heads, LayerNorm_type, ffn_expansion_factor, bias, is_DA,
-                 attn_class=Attention):   # 默认使用原始交叉注意力，保持 Net_D 兼容
+                 attn_class=Attention):   # 默認使用原始交叉注意力，保持 BDNet 兼容
         super(MultiAttentionBlock, self).__init__()
         self.norm1 = LayerNorm(dim, LayerNorm_type)
         self.co_attn = attn_class(dim, num_heads, bias)
@@ -433,10 +433,10 @@ class FRMA(torch.nn.Module):
         return F, Fw, f
 
 
-# ========================== Net_D (完全保持不变，使用原始注意力) ==========================
-class Net_D(torch.nn.Module):
+# ========================== BDNet (Blind Degradation Network) ==========================
+class BDNet(torch.nn.Module):
     def __init__(self, config):
-        super(Net_D, self).__init__()
+        super(BDNet, self).__init__()
         self.dim = config.dim
         in_channels = config.in_channels
         dim = config.dim
@@ -492,10 +492,10 @@ class Net_D(torch.nn.Module):
         return F, KD, f_Y, f, anchor
 
 
-# ========================== Net_R (使用 Restormer 风格注意力) ==========================
-class Net_R(torch.nn.Module):
+# ========================== BRNet (Blind Restoration Network) ==========================
+class BRNet(torch.nn.Module):
     def __init__(self, config):
-        super(Net_R, self).__init__()
+        super(BRNet, self).__init__()
         in_channels = config.in_channels
         dim = config.dim
         num_seq = config.num_seq
@@ -626,15 +626,15 @@ class Net_R(torch.nn.Module):
 
 
 # ========================== 总模型 ==========================
-class FMANet(torch.nn.Module):
+class FGAFNet(torch.nn.Module):
     def __init__(self, config):
-        super(FMANet, self).__init__()
+        super(FGAFNet, self).__init__()
         self.stage = config.stage
-        self.degradation_learning_network = Net_D(config)
+        self.degradation_learning_network = BDNet(config)
         self.bwarp = ImageBWarp(config.scale, config.num_seq)
         self.ddf = DynamicDownsampling(config.ds_kernel_size, config.scale)
         if self.stage == 2:
-            self.restoration_network = Net_R(config)
+            self.restoration_network = BRNet(config)
 
     def forward(self, x, y=None, blind_mask=None):
         result_dict = {}

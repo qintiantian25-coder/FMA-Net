@@ -392,7 +392,7 @@ def run_consistent_simulation(src_dir, dst_dir, mask_dir):
 
 if __name__ == "__main__":
     # 示例（可根据需要修改）
-    DATA_BASE = r"D:\project\FMA-Net\data"
+    DATA_BASE = r"D:\project\FGAF-Net\data"
     run_consistent_simulation(
         src_dir=os.path.join(DATA_BASE, "val_sharp", "001"),
         dst_dir=os.path.join(DATA_BASE, "val_blur", "001"),

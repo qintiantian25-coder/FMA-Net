@@ -42,7 +42,7 @@ def check_img_size(x, window_size):
 
 
 def generate_flow(dir_path):
-    dist_list = [1] # for FMA-Net w/ T=3
+    dist_list = [1] # for FGAF-Net w/ T=3
 
     parser = argparse.ArgumentParser()
     # --model ./pretrained/raft-sintel.pth --mixed_precision
@@ -99,5 +99,5 @@ if __name__ == '__main__':
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
     # 指向你的干净图根目录
-    generate_flow(r'D:\mangyuan\FMA-Net\data\train_sharp')
-    generate_flow(r'D:\mangyuan\FMA-Net\data\val_sharp')
+    generate_flow(r'D:\mangyuan\FGAF-Net\data\train_sharp')
+    generate_flow(r'D:\mangyuan\FGAF-Net\data\val_sharp')

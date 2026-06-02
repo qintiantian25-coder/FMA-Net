@@ -431,7 +431,7 @@ def run_consistent_simulation(src_dir, dst_dir, mask_dir):
 
 if __name__ == "__main__":
     # 根据您的数据集路径进行修改
-    DATA_BASE = r"D:\project\FMA-Net\data"
+    DATA_BASE = r"D:\project\FGAF-Net\data"
 
     # 示例：处理训练集中的城市类别（001）
     run_consistent_simulation(

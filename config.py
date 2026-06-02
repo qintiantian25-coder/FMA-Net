@@ -50,7 +50,7 @@ class Config:
         self.flow_loss_weight = float(parser.get("loss", "flow_loss_weight", fallback="0.0"))
         self.D_TA_loss_weight = float(parser.get("loss", "D_TA_loss_weight", fallback="0.0"))
         self.R_TA_loss_weight = float(parser.get("loss", "R_TA_loss_weight", fallback="0.0"))
-        self.Net_D_weight = float(parser.get("loss", "Net_D_weight", fallback="0.0"))
+        self.BDNet_weight = float(parser.get("loss", "BDNet_weight", fallback="0.0"))
         # 盲元判定阈值：用于 stage-2 的 mask 监督与盲元区域对齐统计。
         self.blind_mask_threshold = float(parser.get("loss", "blind_mask_threshold", fallback=parser.get("training", "blind_mask_threshold", fallback="0.08")))
         # Stage-2 盲元专项分支损失权重：仅对盲元掩码区域生效。
